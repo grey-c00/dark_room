@@ -1,0 +1,1 @@
+design a vending machine that accepts coin as input and can deliver inventory

@@ -1,0 +1,15 @@
+Design a ConfigurationManager class using the Singleton pattern.
+
+Requirements:
+
+It should allow setting and getting configuration key-value pairs.
+
+Only one instance should ever be created, no matter how many times the class is accessed.
+
+If an instance already exists, return it.
+
+
+kubectl logs -f alt-svc-streamd-547b9c68d6-mnw7t -c alt-svc-streamd --namespace=prod --kubeconfig=.kube/config
+
+
+SPARK_WORKER_INSTANCES=1 ./sbin/start-slave.sh "spark://10.0.4.195:7077"

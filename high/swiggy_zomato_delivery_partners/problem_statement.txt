@@ -1,0 +1,11 @@
+Design the high level of a delivery system
+
+1. Functional Requirement
+    - The system should allow users to place orders for food delivery.
+    - Users should be able to track their orders in real-time.
+    - The system should provide a user-friendly interface for both customers and delivery partners.
+
+ 2. Non-Functional Requirement
+    - The system should be scalable to handle a large number of users and orders.
+    - Single person should not be delivering more than 20 orders at a time.
+    - Higher rated delivery partners should be prioritized for order assignments.

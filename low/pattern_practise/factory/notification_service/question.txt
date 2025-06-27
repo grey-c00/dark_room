@@ -1,0 +1,14 @@
+📌 Problem Statement:
+    Design a Notification Service that can send messages via multiple channels:
+
+        📧 Email
+        📱 SMS
+        📲 Push Notification
+        💬 Slack
+    The system should be easily extendable to support new notification channels without modifying existing code.
+
+🎯 Requirements:
+    A user or system sends a notification request.
+    Based on the notification type, the system should instantiate the correct notification sender.
+    The notification sender should implement a common interface.
+    The system must support easy addition of new channels.

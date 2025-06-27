@@ -1,0 +1,21 @@
+🧩 Problem Statement: Meal Order Builder System
+    📜 Background:
+            You're building a system for a smart food ordering kiosk (like in fast food chains). Each Meal consists of multiple customizable parts: Main Item, Side Item, Drink, and optionally Dessert or Sauces. Different types of meals (e.g., Veg, Non-Veg, Kids, Combo) may include different combinations of these parts.
+
+            You are asked to design a flexible and maintainable system to build meal orders, step by step, based on user inputs or pre-defined presets.
+
+    🎯 Requirements:
+            A Meal object should be created step-by-step (not all attributes are required).
+
+            Support building:
+
+            Custom Meals (user selects components)
+
+            Predefined Meal Combos (e.g., Veg Combo, Kids Meal, Family Pack)
+
+            Ensure the client doesn't directly construct the Meal object.
+
+            Support future extensibility (e.g., add healthy options, calorie tracking, etc.)
+
+
+[status] = incomplete because i worked on bridge pattern

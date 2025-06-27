@@ -1,0 +1,13 @@
+1- 📌 Multiple Sync: The framework should support logging in multiple places, such as console, log file, database, and distributed queue.
+    Eg: CRITICAL should be redirected to console + log files
+    Error should be redirected to console + log file
+    Debug should be redirected to log file
+    and more....
+
+2- 📌 Multiple Categories: The framework should support logging into multiple categories, such as info, debug, and error.
+3- 📌 Configurability: The category and logging location should be configurable.
+
+1. low latency
+2. high throughput
+3. no log corruption and loss
+4. consider pushing it to console - on live system

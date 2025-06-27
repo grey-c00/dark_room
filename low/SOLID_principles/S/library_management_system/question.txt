@@ -1,0 +1,22 @@
+status - [incomplete]
+
+
+Requirements:
+
+1. Create a library management system that allows users to borrow and return books.
+2. Once book is borrowed or returned, same should be notified to user
+3. The system should keep track of the number of books borrowed and returned by each user.
+4. if multiple users try to book the same book, consider handling concurrency as well
+
+
+Manage Book Records
+    Each book has a title, author, ISBN, and availability status.
+
+Allow Borrowing and Returning Books
+    A user can borrow or return a book, which updates its availability.
+
+Log Transactions
+    Each borrow/return should be logged with a timestamp and user ID.
+
+Notify Users
+    When a book is successfully borrowed or returned, send a notification (e.g., print to console or log).

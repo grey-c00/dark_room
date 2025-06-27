@@ -1,0 +1,4 @@
+🧠 Scenario:
+You are designing a universal Remote Control system that should work with multiple TV brands (e.g., Sony, Samsung, LG).
+You want to keep the Remote (control interface) and the TV implementation (device behavior) decoupled,
+so new TVs or new types of remotes can be added independently.

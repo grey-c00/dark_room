@@ -1,0 +1,15 @@
+Design a scalable Railway ticket booking system
+
+Function Requirements
+    - User registration and authentication.
+    - User should be able to search for trains between two stations.
+    - User should be able to book tickets for a train.
+    - User should be able to availability of tickets for a train.
+    - User should be able to see the history of booked tickets.
+    - User should be able to get details from a PNR
+
+Non-Functional Requirements
+    - The system should be able to handle a large number of users and transactions.
+    - The system should be highly available and reliable.
+    - The system should be consistent and should not allow double booking of tickets.
+    - Latency in ticket booking should be as low as possible.

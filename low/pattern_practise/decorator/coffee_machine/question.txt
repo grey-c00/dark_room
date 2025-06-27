@@ -1,0 +1,18 @@
+☕ Requirements:
+    The system must support multiple base drinks:
+        Espresso
+        House Blend
+        Dark Roast
+
+    The system should allow optional add-ons:
+        Milk
+        Mocha
+        Soy
+        Whipped Cream
+        etc.
+
+    Each add-on has an additional cost
+    You should be able to calculate the total cost of the drink including its add-ons.
+    The final drink should also include a description like:
+        Description: Dark Roast, Milk, Mocha
+        Cost: $1.75
