@@ -137,8 +137,112 @@ We can say the Core is the actual physical unit that is responsible for executio
 When Spark asks for "cores", in most practical (cloud/VM) environments, you’re giving it vCPUs — and that’s okay.
 
 ## Caching in PySpark
+Caching (and persistence) allows Spark to store intermediate results in memory (or disk) so they can be reused across multiple actions without recomputing them.
+
+Let’s Take This Example:
+
+```python
+df = spark.read.csv("bigfile.csv", header=True)
+
+df.cache()  # Step 1: Cache raw input
+
+df_filtered = df.filter("status = 'active'")
+df_filtered.groupBy("city").count().show()  # Step 2: Triggers shuffle
+
+```
+- Step 1 caches the original input 
+- When you do groupBy("city"), Spark must reshuffle the data based on hash(city)
+- So, even though the data is cached, it is not pre-shuffled 
+- ➡️ Shuffle still happens
+
+
 ### where does the .cache() resides, On driver or each node?
+When you cache a DataFrame (or RDD), Spark partitions it and stores each partition in memory (or on disk) on the executor where it was last computed. Spark does not move cached partitions around. The driver only holds references to metadata, not actual data blocks.
+
+So if you cache a DataFrame with 8 partitions and you have 4 executors:
+- Some executors may store 2 cached partitions each 
+- Others might store more if skewed
+
 ### what is there is no enough space to cache the data then what will happen?
+If Spark cannot cache all data in memory, it will spill to disk or evict blocks, depending on the storage level used. Disk spill files are temporary and exist on the executor's local disk (check /tmp or spark.local.dir path)
+
+
+In case of `MEMORY_ONLY` caching - 
+- Spark will only use memory 
+- If not enough memory:
+  - Uncached partitions are **recomputed** when needed
+
+Here, What does “recomputed” mean:- 
+- If you're using MEMORY_ONLY and caching fails due to lack of space:
+  - Spark will discard that partition 
+  - If a future action needs it → Spark re-runs the entire lineage (all previous transformations) to recreate that partition
+- What Happens Under the Hood?
+  - Spark stores cached partitions in BlockManager
+  - When memory is full:
+    - It may evict less-used cached blocks using LRU (Least Recently Used) strategy
+    - If using MEMORY_AND_DISK, the evicted blocks go to disk
+  - If not enough memory + disk (or you use MEMORY_ONLY), blocks are discarded
+  - which blocks will be evicted?: 
+    - When your executors' memory starts to run out, Spark must evict older or less-used cached data to allow new data to be cached — this is what we call eviction.
+    - Eviction is handled by Spark’s BlockManager, which manages the memory used for:
+      - Cached data (RDD/DataFrame partitions)
+      - Broadcast variables 
+      - Shuffle data
+    - Only cached RDD/DataFrame blocks are evicted. 
+    - Broadcast variables and shuffle blocks are managed differently. 
+    - Spark never evicts data actively being used in a task — only idle blocks.
+    - Spark uses LRU (Least Recently Used) eviction policy by default.
+    - The partition that was used least recently is evicted first when more memory is needed.
+
+### executor memory configuration around caching and computations
+Here `--executor-memory` from CLI is equivalent to `spark.executor.memory` from configurations.
+
+Lets understand memory breakdown of PySpark executor - 
+```commandline
++----------------------------+  ← Total executor memory (--executor-memory)
+| Reserved Memory (~300 MB) |  ← Fixed, for JVM internals [e.g., GC, thread stacks, code cache etc][Not configurable, Spark subtracts this upfront]
++----------------------------+
+| Spark Memory              |  ← Managed by Unified Memory Manager
+|                            |
+|  +----------------------+ |
+|  | Execution Memory     | | ← For shuffles, joins, aggregations, sort, etc. [Temporary and released after stage completes]
+|  +----------------------+ |
+|  | Storage Memory       | | ← For caching/persisting DataFrames/RDDs [May evict cached blocks if execution memory needs more]
+|  +----------------------+ |
++----------------------------+
+
+```
+#### Dynamic Borrowing Between Execution & Storage:
+Thanks to Unified Memory Manager, there’s no hard boundary.
+
+Rules:
+- Execution can borrow from Storage by evicting cached blocks 
+- Storage CANNOT borrow from Execution (it will fail to cache if space is full)
+- This ensures Spark always favors computation over caching
+
+#### Actual Memory Calculations
+Lets say, --executor-memory 8g, then Internally:
+- Reserved Memory ≈ 300 MB 
+- Usable memory = 8 GB - 300 MB = 7.7 GB 
+- Spark Memory = ~6.16 GB (by default, 75% of usable memory)
+- Default breakdown:
+  - Execution = ~3.08 GB 
+  - Storage = ~3.08 GB (for cache)
+
+Memory breakdown to Execution and Storage can be controlled by:
+```bash
+--conf spark.memory.fraction=0.6       # default is 0.6
+--conf spark.memory.storageFraction=0.5  # 50% for cache, 50% for execution
+
+```
+Meaning:
+- 60% of heap goes to Spark memory (execution + storage)
+- 50% of that 60% goes to storage (i.e. 30% of total executor memory)
+
+
+### cache vs Persist
+
+`cache()` is a shorthand for `persist(StorageLevel.MEMORY_AND_DISK)`, meaning it stores data in memory only. While, persist() offers more control over how data is stored, including options like MEMORY_ONLY, MEMORY_AND_DISK_SER, and DISK_ONLY. 
 
 
 ## How to read a big file that is not partitioned (in PBs ) and then process it?
@@ -362,6 +466,8 @@ Why Is Skew a Problem in Spark:
 
 ## what is partitioning in Spark?
 ## what is partition / shuffle partition
+## Partition tuning in transformations
+## where and how computations of multiple stages are written? where internal RDDs resides
 ## How to optimize Spark jobs?
 
 
@@ -498,13 +604,94 @@ Now lets understand what happens step by step when a job is submitted -
 4. 
 
 
-
+## Serializer in Pyspark
+### Kryo vs Java
 
 # Spark in standalone mode
 # spark in cluster mode such as EMR
 # Spark executor and driver memory
 
 # Spark Architecture (master, driver, slave)
+
+# what is master and driver are sitting on same instance?
+
+# Spark UI
+
+# Spark configuration 
+spark.master
+spark.sql.shuffle.partitions
+spark.driver.extraJavaOptions
+spark.executor.extraJavaOptions
+spark.jars.package
+spark.port.maxRetries
+spark.default.parallelism
+spark.python.worker.memory
+spark.driver.memory
+spark.executor.memory
+
+
+
+# Notebook tests
+
+## What happens if you only set spark.driver.memory, but not spark.executor.memory?
+### In cluster mode - 
+
+Spark will allocate memory only for the driver as specified, and will use default memory settings, which is usually 1 GB (or based on your cluster manager’s default, like YARN or standalone). for the executors. This could create OOM on executors.
+
+
+### In local mode - 
+
+Local mode is where everything (driver + executors) runs in a single JVM process on your local machine.
+- Driver = Executor 
+- All components (DAG scheduler, task threads, memory manager, cache) live in one process 
+- Threads do the work instead of launching remote JVM executors
+
+Since there are no separate executors, spark.executor.memory (or --executor-memory) has no effect in local mode.
+
+Memory Breakdown:-
+```commandline
++-------------------------+  ← Total = --driver-memory (e.g., 6 GB)
+| Reserved Memory (~300MB)|  ← JVM internals
++-------------------------+
+| Spark Managed Memory    |
+|                         |
+|  +--------------------+ |
+|  | Execution Memory   | | ← For shuffle, sort, joins, UDFs
+|  +--------------------+ |
+|  | Storage Memory     | | ← For cache(), broadcast, persist()
+|  +--------------------+ |
++-------------------------+
+| User Memory             |  ← UDF objects, accumulators, logs, etc.
++-------------------------+
+
+```
+
+In local mode, `spark.memory.fraction` will still be respected. Lets say
+```commandline
+spark.driver.memory = 8g
+spark.memory.fraction = 0.7
+```
+- Reserved memory = ~300 MB (JVM overhead)
+- Available heap = 8 GB - 300 MB = 7.7 GB 
+- Spark-managed memory = 70% of 7.7 GB ≈ 5.39 GB
+
+This 5.39 GB is split between:
+- Execution memory (default: 50% of that)
+- Storage memory (default: 50%)
+
+That split is further controlled by:
+
+`spark.memory.storageFraction = 0.5  # Default`
+
+So:
+- Execution memory = ~2.69 GB
+- Storage memory = ~2.69 GB
+
+if `spark.memory.fraction` is not specified then a default behaviour of `0.6` is used. So, it is always there in background.
+
+
+## Trying out different different executor memory configuration-
+
 
 
 
