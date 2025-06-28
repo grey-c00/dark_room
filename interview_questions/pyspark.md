@@ -432,6 +432,8 @@ Now lets understand what happens step by step when a job is submitted -
 
 
 ## Lets understand a bit about memory distribution, JVM, driver and executor memory, os requirements, DAG scheduler, Job scheduler, memory manager, threadpool executor -
+
+```commandline
 +-------------------------------------------------------------+
 | JVM Process (your PySpark/Spark app)                        |
 |                                                             |
@@ -446,6 +448,8 @@ Now lets understand what happens step by step when a job is submitted -
 |                                                             |
 |        Shared JVM Heap (configurable via --executor-memory)|
 +-------------------------------------------------------------+
+
+```
 
 1. JVM Heap Space in Spark
    - The allocated memory area for object storage and processing inside the JVM. 
