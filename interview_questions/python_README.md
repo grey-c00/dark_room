@@ -176,3 +176,29 @@ Catching broad exceptions: except Exception: instead of specific ones
 Writing long functions instead of modular code
 
 Overuse of global variables
+
+## what is lambda function?
+A lambda function in Python is a small, anonymous function — meaning it doesn’t have a name like regular functions defined using def.
+```
+lambda arguments: expression
+```
+### Common Use Cases
+1. With map():
+    ```
+    nums = [1, 2, 3, 4]
+    squares = list(map(lambda x: x * x, nums))
+    ```
+2. With filter():
+    ```
+    evens = list(filter(lambda x: x % 2 == 0, nums))
+    ```
+3. With sorted() for custom sorting:
+    ````commandline
+    pairs = [(1, 'b'), (2, 'a'), (3, 'c')]
+    sorted_pairs = sorted(pairs, key=lambda x: x[1])
+    
+    ````
+
+
+
+
