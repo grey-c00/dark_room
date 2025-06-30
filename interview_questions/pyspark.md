@@ -469,6 +469,9 @@ Why Is Skew a Problem in Spark:
 ## Partition tuning in transformations
 ## where and how computations of multiple stages are written? where internal RDDs resides
 ## How to optimize Spark jobs?
+## what happens when we do .collect(), How do i know if OOM happened at driver side or executor side?
+1. in cluster mode
+2. in local mode
 
 
 # How many resource should be left for the OS in case of

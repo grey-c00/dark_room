@@ -198,6 +198,9 @@ lambda arguments: expression
     sorted_pairs = sorted(pairs, key=lambda x: x[1])
     
     ````
+   
+
+## Memory management in Python
 
 
 

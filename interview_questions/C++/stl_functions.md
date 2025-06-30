@@ -98,6 +98,12 @@ it = cars.begin() + 1;
 it = cars.end() - 1;
 
 ```
+
+- Use `std::distance(itr1, itr2)` to find the number of elements between two iterators.
+  - Time complexity of this operation
+    - For Random-Access Iterators (Used by: std::vector, std::deque, arrays), we can directly subtract the iterators, which is O(1).
+    - For Bidirectional / Forward / Input Iterators (Used by: std::set, std::map, std::list, std::unordered_set, etc.), Cannot subtract directly, hence time complexity is O(n)
+
 #### Why do we say "point"?
 
 Iterators are like "pointers" in that they "point" to elements in a data structure rather than returning values from them. They refer to a specific position, providing a way to access and modify the value when needed, without making a copy of it. For example:
@@ -169,6 +175,8 @@ Functions -
 5. traversing: Just like other containers, sets can be easily traversed using range-based for loop or using begin() and end() iterators.
 6. size() - returns the number of elements in the set, time O(1)
 7. empty() - checks if the set is empty, time O(1)
+8. **lower_bound(val)** - returns an iterator pointing to the first element that is not less than n (>=n), This operation is `O(logn)` in std::set.
+9. **upper_bound(val)** - Returns an iterator to the first element strictly greater than n (>n).
 
 
 ## map
