@@ -15,3 +15,6 @@ This is decided based on -
    1. If the data is huge and needs to be scaled horizontally then NoSQL DBs are preferred.
 6. Inserts/updates/append pattern [TODO]
 7. read/write ratio [TODO]
+
+
+## How data is stored in NoSQL DB vs SQL DB?
