@@ -809,3 +809,11 @@ PIVOT (
 3. Key Difference:
    - Bitmap indexes excel with low-cardinality data and complex boolean conditions.
    - B-tree indexes are better for unique or high-cardinality data and range queries.
+
+
+
+## Handling NULL Values: How would you handle NULL values in SQL queries?
+1. Using COALESCE()
+2. Using IFNULL() or ISNULL()
+3. Using NULLIF()
+4. Using CASE Statements

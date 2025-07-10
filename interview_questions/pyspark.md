@@ -630,7 +630,7 @@ Now lets understand what happens step by step when a job is submitted -
 
 # Spark configuration 
 - spark.master 
-- spark.sql.shuffle.partitions: `configuration controls how Spark distributes data across the cluster during shuffle operations (e.g., groupBy, join, distinct, or repartition).`
+- spark.sql.shuffle.partitions: `configuration controls how Spark distributes data across the cluster during shuffle operations (e.g., groupBy, join, distinct, or repartition). Number of partitions that should be avaialbel after shuffle operations.`
     ```commandline
     How It Works
     Scenario: You run a groupBy("user_id").count() on a 1TB dataset.
