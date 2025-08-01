@@ -817,3 +817,78 @@ PIVOT (
 2. Using IFNULL() or ISNULL()
 3. Using NULLIF()
 4. Using CASE Statements
+
+
+## GROUP BY vs Partition By:
+- Purpose: PARTITION BY is used to perform calculations on individual partitions within a result set, while GROUP BY is employed to aggregate data based on specified columns.
+- Scope: PARTITION BY operates within partitions, allowing for separate calculations on each partition, while GROUP BY combines rows into groups for aggregate calculations.
+- Result Set: PARTITION BY retains the original result set but adds window function calculations as additional columns, whereas GROUP BY produces a summarized result set with one row per group.
+
+### GROUP BY
+Purpose: Aggregate data into summary rows.
+
+How it works:
+- Rows are grouped into buckets based on one or more columns. 
+- Each group returns one result row, usually with aggregate functions like SUM(), COUNT(), AVG(), etc.
+
+```sql
+SELECT department, COUNT(*) AS total_employees
+FROM employees
+GROUP BY department;
+
+```
+This returns one row per department with the number of employees.
+
+
+### PARTITION BY
+Purpose: Organize data within a window function, without reducing the number of rows.
+
+How it works:
+- It divides the result set into partitions, and window functions operate within each partition. 
+- Unlike GROUP BY, it retains all original rows.
+```sql
+SELECT 
+    employee_name,
+    department,
+    salary,
+    RANK() OVER (PARTITION BY department ORDER BY salary DESC) AS salary_rank
+FROM employees;
+
+```
+This returns all employees, but for each department, it ranks salaries within that department.
+
+### Summary:
+
+| Feature           | `GROUP BY`                           | `PARTITION BY`                                   |
+|-------------------|--------------------------------------|--------------------------------------------------|
+| Used With         | Aggregation functions (`SUM`, `AVG`) | Window functions (`RANK`, `ROW_NUMBER`, etc.)    |
+| Rows Returned     | One row per group                    | All original rows                                |
+| Groups/Partitions | Collapses rows into groups           | Divides rows into partitions, but keeps them all |
+| Output Shape      | Fewer rows                           | Same number of rows                              |
+
+
+
+## Merge / Upsert:
+
+The MERGE statement in SQL allows you to combine data from a source table with a target table based on a specified condition. It then performs actions such as updating existing records or inserting new ones, depending on whether a match is found between the two tables. This functionality makes it ideal for upserting and updating records when they exist and inserting new ones when they don't.
+
+Syntax:
+```sql
+MERGE <target_table> AS target
+
+USING <source_table> AS source
+
+ON <join_condition>
+
+WHEN MATCHED THEN
+
+    <update_statement>
+
+WHEN NOT MATCHED THEN
+
+    <insert_statement>
+
+WHEN NOT MATCHED BY SOURCE THEN
+
+    <delete_statement>
+```
