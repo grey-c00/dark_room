@@ -43,6 +43,12 @@
 - Distributed Systems
 - Data Structures and Algorithms
 - Real time processing
+- High level design
+- Low level design
+- Event driven architecture
+- Linux
+- MutilThreading and concurrency
+- Docker
 
 
 ## Resume Template

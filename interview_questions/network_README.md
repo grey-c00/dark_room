@@ -259,3 +259,101 @@ Purpose:
 13. **Caching Protocols**: For improving performance (e.g., Redis, Memcached).
 14. **Analytics Protocols**: For tracking user behavior (e.g., Google Analytics, Mixpanel).
 
+
+### WebSocket and WebRTC protocols
+
+
+## How WebSocket actually works?
+is it like keeping connection open or what?
+
+
+WebSocket is a communication protocol that provides full-duplex (two-way) communication between a client (like a web browser) and a server, over a single, long-lived TCP connection.
+
+#### In simple terms:
+It lets your browser and server talk to each other instantly and continuously, without having to reload the page or repeatedly send HTTP requests.
+
+WebSocket transmits text and binary data. Examples:
+- JSON messages 
+- Chat messages 
+- Game state updates 
+- Binary files (with blobs/array buffers)
+
+
+#### How it works?
+
+On the Client Side: The browser (or Python client) creates a WebSocket object that represents the connection to the server.
+```javascript
+const socket = new WebSocket("ws://localhost:8765");
+```
+
+This object (socket) is:
+- A local representation of the open TCP/WebSocket connection 
+- Used to send and receive messages 
+- Doesn’t contain the server's internal WebSocket object
+
+➡️ It does not reference the server's WebSocket object — it just talks to the server over the network.
+
+
+
+On the Server Side:
+The Python server receives a new WebSocket connection object for each connected client.
+```python
+async def handler(websocket, path):
+  # This 'websocket' is specific to this client connection
+  pass
+```
+
+
+That websocket object:
+- Represents the TCP connection to one client 
+- Is the server’s way to send/receive messages from that specific client 
+- Doesn’t contain or expose the client's internal WebSocket object
+
+➡️ The server has a reference to a socket endpoint that connects to the client, not the actual client-side object.
+
+
+|           | Client                             | Server                                 |
+|-----------|------------------------------------|----------------------------------------|
+| **Has**   | WebSocket object to talk to server | WebSocket object to talk to one client |
+| **Sees**  | A channel to send/receive data     | A channel to send/receive data         |
+| **Knows** | Nothing about server internals     | Nothing about client internals         |
+
+Each side holds a local object that represents the same underlying network connection, but neither side directly holds a reference to the other’s object in memory.
+
+
+#### Advanced Note: Shared State
+If you want to track clients on the server (e.g., for broadcasting or session management), you can store the websocket objects in a dictionary or list:
+```python
+connected_clients = set()
+
+async def handler(websocket, path):
+    connected_clients.add(websocket)
+    try:
+        async for message in websocket:
+            # Broadcast to others, etc.
+            for client in connected_clients:
+                if client != websocket:
+                    await client.send(f"Another said: {message}")
+    finally:
+        connected_clients.remove(websocket)
+
+```
+
+
+## How WebRTC works?
+WebRTC (Web Real-Time Communication) is a set of APIs and protocols that enable direct peer-to-peer communication between browsers or apps — typically for:
+- Live audio/video calls 
+- Real-time file sharing 
+- Low-latency data communication
+
+It works without a server in the media path, unless NAT/firewalls force you to use one (like a TURN server).
+
+Key Use Cases
+- Video/audio chat (e.g., Google Meet, Zoom)
+- P2P file sharing (like ShareDrop)
+- Multiplayer gaming 
+- Live screen sharing 
+- IoT device communication
+
+
+

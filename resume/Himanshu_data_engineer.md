@@ -45,6 +45,12 @@
 - Real time processing
 - microservices
 - inter - service communication
+- High level design
+- Low level design
+- Even driven architecture
+- Linux
+- MutilThreading and concurrency
+- Docker
 
 ## Resume Template
 
