@@ -1,4 +1,4 @@
-## Imp points
+# Imp points
 - tailor resume to job description
 - use keywords from job description
 - use correct format and language
@@ -15,7 +15,7 @@
 
 
 
-## Skills to include - 
+# Skills to include - 
 - PySpark
 - Kafka
 - SQL
@@ -52,6 +52,9 @@
 - MutilThreading and concurrency
 - Docker
 
-## Resume Template
+# Resume Template
 
-## Projects
+# Projects
+
+
+

@@ -1,4 +1,4 @@
-## Imp points
+# Imp points
 - tailor resume to job description
 - use keywords from job description
 - use correct format and language
@@ -15,7 +15,7 @@
 
 
 
-## Skills to include - 
+# Skills to include - 
 - PySpark
 - Kafka
 - SQL
@@ -52,12 +52,38 @@
 - Java
 
 
-## Resume Template
+# Resume Template
 
-## Projects
+# Projects
+
+### RI Reboot
+
+### Customer Support AI chatbot [ToDO]
+problem solved: New customer supports, QAs were asking lots of question about UI behaviour and customer mistakes
+
+### Copilot for customers [ToDO]
 
 ### Designed export service
 - Designed architecture
 - Implemented using AWS Lambda, S3, and API Gateway
 - Contract finalization
+
+### Migration Framework
+
+### API stabilization and performance improvement
+
+
+### Manager Reporting Project
+
+### Assessment Revamp
+
+
+### Data cleanup framework for improved performance
+
+### Migration to DynamoDB from Couchbase
+
+
+### Data Engineering Projects
+I think I can mention some projects that gave me exposure to data engineering as well.
+
 
