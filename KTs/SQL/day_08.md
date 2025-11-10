@@ -220,5 +220,35 @@ No existing data file is rewritten in place — everything is append-only, ensur
 - Simple rollback
 
 
-## Locking Mechanisum
-<Read about it and update here>
+## PostgreSQL Locks & Concurrency — Quick Reference
+PostgreSQL uses MVCC (Multi-Version Concurrency Control):
+
+- Readers never block writers (and vice versa)
+- Each transaction sees a snapshot of data as of its start
+- Updates create new row versions instead of overwriting
+
+So:
+- ✅ SELECT → doesn’t block UPDATE
+- ✅ UPDATE → doesn’t block SELECT
+- ❌ Two UPDATEs on the same row → conflict (row-level lock)
+
+### Transaction Isolation Levels
+
+| Level               | Behavior                                          | Notes                         |
+| ------------------- | ------------------------------------------------- | ----------------------------- |
+| **READ COMMITTED**  | Default — each statement sees only committed data | Safe & performant             |
+| **REPEATABLE READ** | Sees same snapshot throughout the transaction     | Prevents non-repeatable reads |
+| **SERIALIZABLE**    | True serial execution (via predicate locks)       | Slower but safest             |
+
+
+These isolation levels can be set on db level. Example:
+
+```sql
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+```
+
+
+Deadlocks
+- Occur when transactions wait on each other in a cycle
+- PostgreSQL detects and aborts one automatically
+
