@@ -892,3 +892,249 @@ WHEN NOT MATCHED BY SOURCE THEN
 
     <delete_statement>
 ```
+
+
+# I-Questions
+
+## We have a table with columns A,B,C,D and created index1 on A, and index2 on A & B. If query `select * from table where A=<some value>` is given, then which index will be selected?
+
+### Which Index Gets Selected — index1(A) or index2(A,B)?
+
+We have a table with columns A, B, C, D and two indexes:
+- `index1` on column `A`
+- `index2` on columns `A` and `B`
+
+Query in question:
+```sql
+SELECT * FROM table WHERE A = <some value>
+```
+
+---
+
+### The Short Answer
+
+**Both indexes are valid candidates, but the database will most likely choose `index1` (the single column index on A).**
+
+---
+
+### Why Both Indexes Are Valid
+
+Both `index1 (A)` and `index2 (A, B)` can satisfy the query `WHERE A = <some value>` because:
+
+- `index1` is built on `A` — directly answers the filter
+- `index2` is built on `(A, B)` — since `A` is the **leftmost prefix**, the index can still be used to filter on `A` alone. This is called the **leftmost prefix rule**
+
+So both can technically answer the query. The database's **query optimizer** decides which one to use.
+
+---
+
+### Why the Optimizer Will Likely Prefer index1
+
+#### Index Size
+
+`index1` only stores values of column `A`. `index2` stores values of both `A` and `B`. This means:
+
+- `index1` has **smaller index entries** — each entry takes less space
+- Smaller entries mean **more entries fit per disk page / memory page**
+- Fewer pages need to be read to scan the index
+- `index1` is physically smaller and faster to traverse
+
+#### Selectivity and Statistics
+
+The query optimizer looks at **statistics** — the distribution of data in the table. It estimates how many rows a given index lookup will return. Since both indexes filter on the same column `A` with the same condition, the number of rows returned is identical. But `index1` gets there with less overhead.
+
+#### No Extra Benefit from B
+
+The query is `WHERE A = <value>`. Column `B` plays no role in filtering. Using `index2` would carry the extra weight of `B`'s data in the index for zero benefit on this particular query.
+
+---
+
+### When the Optimizer Might Choose index2 Instead
+
+The optimizer is not rigid — it can choose `index2` in specific situations:
+
+#### Covering Index Scenario
+
+If the query were:
+
+```sql
+SELECT A, B FROM table WHERE A = <some value>
+```
+
+The optimizer would **strongly prefer `index2`** because it contains both `A` and `B`. The query can be answered entirely from the index without touching the actual table at all. This is called a **covering index** — the index "covers" all the columns the query needs.
+
+But the query is `SELECT *` — it needs all columns `A, B, C, D`. Neither index covers all columns, so the optimizer must hit the main table anyway. In this case `index2` gives no covering advantage.
+
+#### If index1 Does Not Exist
+
+If only `index2` exists, the optimizer will use it — applying the leftmost prefix rule to filter on `A`.
+
+#### Optimizer Hints
+
+In some databases you can force a specific index:
+
+```sql
+-- MySQL
+SELECT * FROM table USE INDEX (index2) WHERE A = <value>;
+
+-- Oracle
+SELECT /*+ INDEX(table index2) */ * FROM table WHERE A = <value>;
+```
+
+---
+
+### The Leftmost Prefix Rule
+
+For a composite index on `(A, B)`, here is what queries can and cannot use it:
+
+| Query | Can use index2 (A, B)? | Reason |
+|---|---|---|
+| `WHERE A = ?` | Yes | A is the leftmost prefix |
+| `WHERE A = ? AND B = ?` | Yes | Full index used |
+| `WHERE B = ?` | No | A is skipped — leftmost prefix violated |
+| `WHERE A > ? AND B = ?` | Partial | Range on A limits B usage |
+
+---
+
+### What Actually Happens Internally
+
+When the optimizer receives `WHERE A = <value>`:
+
+1. It looks at all available indexes on the table
+2. It identifies `index1` and `index2` as both capable of serving the query
+3. It estimates the **cost** of using each — factoring in index size, page reads, and whether a table lookup is needed after
+4. It picks the index with the **lowest estimated cost**
+5. For `SELECT *` with a filter only on `A`, `index1` wins because it is smaller and equally selective
+
+---
+
+### Summary
+
+| Factor | index1 (A) | index2 (A, B) |
+|---|---|---|
+| Can serve `WHERE A = ?` | Yes | Yes (leftmost prefix) |
+| Index entry size | Smaller | Larger (carries B too) |
+| Pages to read | Fewer | More |
+| Covering for `SELECT *` | No | No |
+| Likely chosen for this query | **Yes** | Only if index1 absent |
+
+The database will almost always choose `index1` for this query — not because `index2` is wrong, but because `index1` is leaner and equally effective for a filter purely on `A`.
+
+## How is data retrieved in a SQL Database?
+
+Data retrieval in SQL databases is performed using the `SELECT` statement, which is the primary means to query data. SQL allows you to specify exactly which records and columns you want through a rich set of query options. Below are key points covering how data is retrieved in SQL databases:
+
+### 1. Basic Data Retrieval
+
+- To fetch all columns from a table:
+    ```sql
+    SELECT * FROM table_name;
+    ```
+- To fetch specific columns:
+    ```sql
+    SELECT column1, column2 FROM table_name;
+    ```
+
+### 2. Filtering Rows
+
+- Use the `WHERE` clause to filter rows that meet certain conditions:
+    ```sql
+    SELECT * FROM employees WHERE department = 'Sales' AND salary > 50000;
+    ```
+
+### 3. Sorting Results
+
+- Use the `ORDER BY` clause to sort query results:
+    ```sql
+    SELECT * FROM products ORDER BY price DESC;
+    ```
+
+### 4. Aggregations and Grouping
+
+- Use aggregation functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) with `GROUP BY` to get summarized results:
+    ```sql
+    SELECT department, AVG(salary) FROM employees GROUP BY department;
+    ```
+
+### 5. Joining Data from Multiple Tables
+
+- Use `JOIN` clauses (`INNER JOIN`, `LEFT JOIN`, etc.) to combine data from multiple related tables:
+    ```sql
+    SELECT e.name, d.name AS department
+    FROM employees e
+    INNER JOIN departments d ON e.department_id = d.id;
+    ```
+
+### 6. Pagination (Limiting Results)
+
+- Use `LIMIT` (in MySQL, PostgreSQL) or `TOP` (in SQL Server) to restrict the number of rows returned:
+    ```sql
+    SELECT * FROM orders ORDER BY order_date DESC LIMIT 10;
+    ```
+
+### 7. Advanced Filtering
+
+- Use `IN`, `BETWEEN`, `LIKE`, and subqueries for more advanced filtering:
+    ```sql
+    SELECT email FROM customers WHERE email LIKE '%@gmail.com';
+    ```
+
+### 8. Index Utilization
+
+- Data retrieval is optimized using indexes. The database engine chooses the optimal path (scan, index seek, etc.) automatically based on query structure and available indexes.
+- You can analyze how your query executes by using `EXPLAIN` (PostgreSQL, MySQL) to understand which indexes are being used.
+
+### 9. Transaction and Isolation
+
+- Data retrieval operations respect transaction isolation levels (e.g., Read Committed, Repeatable Read), ensuring consistency and correct visibility of data in concurrent environments.
+
+### 10. Result Set
+
+- The result of a `SELECT` is a result set (virtual table) containing the matching records. The application or another SQL statement can further process this data.
+
+**Summary:**  
+Data retrieval in a SQL DB is highly flexible and powerful, leveraging the `SELECT` statement along with filtering (`WHERE`), sorting (`ORDER BY`), grouping (`GROUP BY`), joining, and limiting. Well-designed schemas and indexes are critical for fast, efficient data retrieval, especially at scale.
+
+
+## What is threading in SQL DB?
+
+## How does SQL choose which index to use? (e.g., between A-B, A-B-C, A-B-C-D indexes)
+
+- The SQL query planner (optimizer) uses the following detailed process:
+    1. **Parsing and Normalization:** SQL statement parsed and normalized; identifies tables, columns, filters, joins, sort orders.
+    2. **Statistics Gathering:** Looks up statistics (`pg_statistic` in PostgreSQL, histograms in MySQL) — includes index column value distribution, number of distinct values, nulls, row counts, min/max.
+    3. **Predicate Analysis:** Examines `WHERE`/`JOIN` clauses. Identifies which columns are filtered, ordered, grouped.
+    4. **Index Matching:**
+        - Considers available indexes (composite and single-column).
+        - Checks leftmost prefix rule: For index on (A,B,C), queries filtering on A or A+B or A+B+C can use it. Query filtering only on B or C cannot.
+        - Seeks exact matches for filter, join, or sort columns.
+    5. **Cost Estimation (Cost-based Planning):**
+        - For each candidate index, estimates I/O cost, CPU cost (using statistics): 
+            - How many rows will match? (selectivity)
+            - Will index-only scan work (is index covering all queried columns)?
+            - Will recheck/base table (heap) lookup be needed?
+            - Will index help order results to avoid sort?
+        - Includes costs for multi-column (composite) indexes: longer indexes help more columns but are larger, so more expensive to scan.
+    6. **Plan Choice:**
+        - Generates alternative query plans using combinations of indexes, sequential scans, joins.
+        - Assigns cost to each plan.
+        - Chooses plan with lowest total estimated cost.
+    7. **Execution:** Uses chosen plan/index.
+
+- Example:
+    - Indexes: (A,B), (A,B,C), (A,B,C,D)
+    - Query: `WHERE A=1 AND B=2 AND C=3`
+        - (A,B,C,D) and (A,B,C) both match; planner likely picks the shortest sufficient one (A,B,C).
+    - Query: `WHERE B=2 AND C=3` 
+        - None match due to leftmost prefix rule.
+    - Query: `WHERE A=1 ORDER BY B,C`
+        - Any index beginning with A can help; longer index may help with ordering, planner weighs cost/benefit.
+
+- At every stage, detailed statistics drive the choice. Use `EXPLAIN` or `EXPLAIN ANALYZE` to see chosen index/plan.
+- Manual hints (e.g., `USE INDEX`, index hints) can override automatic choice in some databases, but optimizer usually best.
+
+Summary: SQL uses statistics, leftmost prefix rules, and cost estimation to pick the most efficient, covering, and selective index for each query.
+
+
+## Problem statement 1:
+Problem statement: consider we need to give cupon to first 100 people who will sign up. Consider that 1000 people click at the same time then how would you ensure that, still being the concurrent requests, how would you make sure we only provide cupon to 100 people. Which DB would you use and why?
