@@ -624,9 +624,2880 @@ Now lets understand what happens step by step when a job is submitted -
 
 # Spark Architecture (master, driver, slave)
 
-# what is master and driver are sitting on same instance?
+# what if master and driver are sitting on same instance?
 
 # Spark UI
+port: 4040 (default)
+
+port can be changed by updating the configuration: `spark.ui.port`
+
+# Spark Join Strategies, Sorting & Merging — Complete Internal Deep Dive
+
+---
+
+## 📌 The Big Picture — How Spark Picks a Join Strategy
+
+When you write `df1.join(df2, "key")`, Spark never just "joins".
+It goes through this decision tree EVERY time:
+
+```
+                    Is one side small enough to broadcast?
+                    (< spark.sql.autoBroadcastJoinThreshold = 10MB default)
+                              │
+                 ┌────────────┴────────────┐
+                YES                        NO
+                 │                          │
+        BroadcastHashJoin          Can the smaller side fit
+        (NO shuffle at all)        in memory as a hash table?
+                                              │
+                                 ┌────────────┴────────────┐
+                                YES                        NO
+                                 │                          │
+                        ShuffleHashJoin           Are both sides
+                        (shuffle + hash)          already sorted?
+                                                            │
+                                                 ┌──────────┴──────────┐
+                                                YES                    NO
+                                                 │                      │
+                                        SortMergeJoin          SortMergeJoin
+                                        (no sort needed)       (sort + merge)
+                                        ← rare in practice
+
+Special cases:
+    Cartesian Join   → when NO join key exists (cross join)
+    BroadcastNestedLoopJoin → fallback for non-equi joins
+```
+
+---
+
+## 🔵 STRATEGY 1 — BroadcastHashJoin (BHJ)
+
+### When Spark uses it:
+```
+One side of the join is SMALL (< 10 MB by default)
+Config: spark.sql.autoBroadcastJoinThreshold = 10485760 (10 MB)
+
+You can also force it:
+    from pyspark.sql.functions import broadcast
+    df1.join(broadcast(df2), "key")
+```
+
+### How it works internally — step by step:
+
+```
+Setup:
+    Large table:  orders     = 100 GB (800 partitions)
+    Small table:  country_codes = 2 MB (1 partition)
+
+Step 1 — Collect small table to Driver
+    Spark reads country_codes (2 MB) completely
+    Sends it to the Driver process memory
+
+Step 2 — Build Hash Map on Driver
+    Driver builds an in-memory hash map:
+    {
+      "US" → Row("US", "United States", "USD"),
+      "IN" → Row("IN", "India", "INR"),
+      "UK" → Row("UK", "United Kingdom", "GBP"),
+      ...
+    }
+
+Step 3 — Broadcast hash map to ALL executors
+    Driver serializes the hash map
+    Sends a COPY to every executor via SparkContext broadcast mechanism
+    Each executor now has the full hash map in its memory
+
+    Executor 1 memory: full country_codes hash map (2 MB)
+    Executor 2 memory: full country_codes hash map (2 MB)
+    Executor 3 memory: full country_codes hash map (2 MB)
+
+Step 4 — Each task does a LOCAL lookup (no shuffle at all)
+    Task reads its 128 MB partition of orders
+    For each row:
+        country = row["country_code"]
+        match   = hashMap.get(country)   ← local memory lookup, O(1)
+        if match: emit joined row
+
+    NO data movement between executors
+    NO shuffle files written
+    NO network transfer of orders data
+```
+
+### Memory layout of the hash map:
+
+```
+Key:   "US"   (String → hashed to int → bucket index)
+Value: Row object stored at that bucket
+
+Lookup:
+    hash("US") → bucket 42 → Row("US", "United States", "USD")
+    Time complexity: O(1) per row
+    Zero network I/O after broadcast
+```
+
+### Why it's the FASTEST join:
+
+```
+✅ Zero shuffle (no disk write, no network for the large side)
+✅ Large table reads flow directly through → never leave their executor
+✅ Only cost: broadcasting the small table once
+
+Performance:
+    orders (100 GB) processed at disk read speed
+    No stage boundaries → all runs in ONE stage
+    No shuffle files written at all
+```
+
+### When it FAILS:
+
+```
+❌ Small table is NOT actually small (> 10 MB) → Spark falls back to SMJ
+❌ Small table after filter is still large → AQE can fix this at runtime
+❌ Driver OOM if small table is collected to driver
+
+Increase threshold (use carefully):
+    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", 50 * 1024 * 1024)  # 50MB
+```
+
+---
+
+## 🔵 STRATEGY 2 — SortMergeJoin (SMJ) ← Most Common for Large Tables
+
+### When Spark uses it:
+```
+Both tables are large (both > broadcast threshold)
+This is the DEFAULT for large-large joins
+Config: spark.sql.join.preferSortMergeJoin = true (default)
+```
+
+### How it works internally — step by step:
+
+```
+Setup:
+    Table A: orders    = 100 GB
+    Table B: customers = 100 GB
+    Join key: customer_id
+    spark.sql.shuffle.partitions = 200
+```
+
+#### Phase 1 — SHUFFLE (redistribute by join key)
+
+```
+Step 1: Both tables are shuffled independently
+
+For orders table:
+    Each of 800 read tasks computes:
+        target = hash(customer_id) % 200
+    Writes data to 200 shuffle buckets on local disk
+
+For customers table:
+    Each of 800 read tasks computes:
+        target = hash(customer_id) % 200
+    Writes data to 200 shuffle buckets on local disk
+
+GUARANTEE after shuffle:
+    All rows with customer_id=8823 from orders   → partition 47
+    All rows with customer_id=8823 from customers → partition 47
+    → same partition number = same executor = can be joined locally
+```
+
+#### Phase 2 — SORT (within each partition)
+
+```
+Step 2: Each of the 200 Stage-1 tasks receives its partition
+
+Task 47 has:
+    orders    partition 47: [cid=8823 row, cid=1201 row, cid=8823 row, ...]  ← UNSORTED
+    customers partition 47: [cid=1201 row, cid=8823 row, cid=4455 row, ...]  ← UNSORTED
+
+Step 3: Task 47 sorts BOTH sides by customer_id
+
+    orders    partition 47 SORTED: [cid=1201, cid=1201, cid=4455, cid=8823, cid=8823]
+    customers partition 47 SORTED: [cid=1201, cid=4455, cid=8823, cid=9001]
+```
+
+#### Phase 3 — MERGE (two-pointer scan)
+
+```
+Step 4: Two-pointer merge scan (like merge sort's merge step)
+
+    orders_ptr    → points to first row: cid=1201
+    customers_ptr → points to first row: cid=1201
+
+    Iteration 1:
+        orders_ptr.cid    == customers_ptr.cid (1201 == 1201) → MATCH
+        Emit joined row
+        Advance orders_ptr → cid=1201 (next orders row, same cid)
+        Emit another joined row (handles duplicates)
+        Advance orders_ptr → cid=4455
+        All 1201 orders exhausted → advance customers_ptr → cid=4455
+
+    Iteration 2:
+        orders_ptr.cid (4455) == customers_ptr.cid (4455) → MATCH
+        Emit joined row
+        Advance both
+
+    Iteration 3:
+        orders_ptr.cid (8823) == customers_ptr.cid (8823) → MATCH
+        orders has TWO rows with 8823:
+            emit row1 × customer_8823
+            emit row2 × customer_8823
+        Advance customers_ptr → cid=9001
+
+    Iteration 4:
+        orders_ptr.cid (end) < customers_ptr.cid (9001)
+        orders exhausted → done
+
+Time complexity: O(N log N) for sort + O(N) for merge
+```
+
+### How sort handles spill (when partition > memory):
+
+```
+Task has 805 MB of data, only 600 MB memory:
+
+    Pass 1 (in-memory sort):
+        Load 600 MB into memory
+        Sort in memory using TimSort (Java's Arrays.sort)
+        Write sorted chunk to local disk: spill_file_1  (600 MB, sorted)
+        Free memory
+
+    Pass 2 (in-memory sort):
+        Load remaining 205 MB into memory
+        Sort in memory
+        Write sorted chunk to local disk: spill_file_2  (205 MB, sorted)
+        Free memory
+
+    Pass 3 (merge pass):
+        Open both spill files with streaming readers
+        Merge two sorted streams into one sorted output
+        Uses only O(1) memory per stream (just a read buffer)
+        Output: one fully sorted partition ready for merge join
+
+    Multiple spill files → multi-way merge:
+        If 5 spill files: open all 5, use a min-heap of 5 elements
+        Pop minimum element, advance that stream
+        O(N log k) where k = number of spill files
+```
+
+---
+
+## 🔵 STRATEGY 3 — ShuffleHashJoin (SHJ)
+
+### When Spark uses it:
+```
+One side fits in memory as a hash table but is > broadcast threshold
+Spark prefers SMJ by default — must be explicitly enabled or chosen by cost optimizer
+
+Enable:
+    spark.conf.set("spark.sql.join.preferSortMergeJoin", "false")
+    or AQE switches to it dynamically
+```
+
+### How it works internally — step by step:
+
+```
+Setup:
+    Table A: orders      = 100 GB  (large side)
+    Table B: customers   = 15 GB   (smaller side, > 10MB so no broadcast)
+
+Step 1 — SHUFFLE BOTH SIDES by join key
+    Same as SMJ: hash(customer_id) % 200
+
+Step 2 — BUILD phase (smaller side only)
+    Each task receives its partition of customers (15 GB / 200 = 75 MB)
+    Builds an in-memory hash map from customers partition:
+    {
+        cid=1201 → [Row(1201, "Alice", ...)],
+        cid=8823 → [Row(8823, "Bob",   ...)],
+        ...
+    }
+    75 MB hash map lives in task memory ✅
+
+Step 3 — PROBE phase (larger side)
+    Task streams through its partition of orders (100 GB / 200 = 500 MB)
+    For each order row:
+        key = order.customer_id
+        matches = hashMap.get(key)   ← O(1) local lookup
+        if matches: emit joined rows
+    
+    Only 500 MB of orders needs to be in memory at a time
+    (streamed, not all loaded at once)
+
+Total memory per task:
+    hash map (75 MB) + streaming probe buffer (~few MB) = ~80 MB ✅
+```
+
+### SHJ vs SMJ comparison:
+
+```
+ShuffleHashJoin:
+    ✅ Faster when one side is small-medium (hash lookup = O(1))
+    ✅ No sort step needed
+    ❌ Hash map must fit in memory → OOM risk if estimation is wrong
+    ❌ Not safe for very large or skewed data
+
+SortMergeJoin:
+    ✅ Always safe — spills gracefully to disk
+    ✅ Works for any size data
+    ❌ Sorting is O(N log N) — slower than hash lookup
+    ❌ Requires two sort passes if data spills
+```
+
+---
+
+## 🔵 STRATEGY 4 — BroadcastNestedLoopJoin (BNLJ)
+
+### When Spark uses it:
+```
+Non-equi joins (no = condition):
+    df1.join(df2, df1.price.between(df2.min_price, df2.max_price))
+    df1.join(df2, df1.date < df2.expiry_date)
+    CROSS JOIN (cartesian product)
+    LEFT/RIGHT/FULL OUTER joins that can't use hash-based methods
+```
+
+### How it works internally:
+
+```
+Step 1 — Broadcast the smaller side (same as BHJ)
+    Serialize small table → broadcast to all executors
+
+Step 2 — Nested Loop scan (no hash, no sort)
+    Each task:
+        for each row in large_partition:          ← outer loop
+            for each row in broadcast_table:      ← inner loop
+                if join_condition(outer, inner):  ← evaluate condition
+                    emit joined row
+
+Time complexity: O(N × M) per partition
+    N = rows in large partition
+    M = rows in broadcast table
+
+Example:
+    Large partition: 10,000 rows
+    Broadcast table: 500 rows
+    → 5,000,000 comparisons per task
+
+This is WHY it's only viable when broadcast table is very small
+```
+
+### Why it's the SLOWEST:
+
+```
+No hash map shortcut → must check every combination
+For equi-joins: always use BHJ or SMJ instead
+BNLJ is truly a last resort
+```
+
+---
+
+## 🔵 STRATEGY 5 — CartesianJoin
+
+### When Spark uses it:
+```
+df1.crossJoin(df2)  ← explicit
+or any join with NO join condition
+
+Output rows = rows_in_df1 × rows_in_df2
+
+Example:
+    df1 = 1,000 rows
+    df2 = 1,000 rows
+    Result = 1,000,000 rows
+
+WARNING: 100 GB × 100 GB = petabytes of output → almost always a mistake
+Must explicitly enable: spark.sql.crossJoin.enabled = true
+```
+
+---
+
+## 🔵 SORTING STRATEGIES — Internal Details
+
+### TimSort (default in-memory sort)
+
+```
+What: Java's Arrays.sort() → hybrid MergeSort + InsertionSort
+When: Data fits entirely in memory
+
+Phase 1 — Find "runs" (already-sorted subsequences):
+    Input: [3, 1, 4, 1, 5, 9, 2, 6, 5]
+    Run 1: [3]  (length 1, trivially sorted)
+    Run 2: [1, 4]  (ascending run detected)
+    ...
+    MinRunLength = 32-64 elements
+    Short runs extended to minRunLength using InsertionSort
+
+Phase 2 — Merge runs using MergeSort:
+    Merge pairs of runs bottom-up
+    Until one fully sorted array remains
+
+Time:  O(N log N) worst case, O(N) for already-sorted data
+Space: O(N) auxiliary memory
+```
+
+### External Sort (when data spills to disk)
+
+```
+What: Multi-pass sort for data larger than available memory
+When: Partition size > task memory
+
+Pass 1 — Sort runs:
+    Load chunk_1 (fits in memory) → TimSort → write sorted_run_1 to disk
+    Load chunk_2 (fits in memory) → TimSort → write sorted_run_2 to disk
+    Load chunk_3 (fits in memory) → TimSort → write sorted_run_3 to disk
+    ...
+
+Pass 2 — K-way merge:
+    Open all sorted runs as streaming readers
+    Use a MIN-HEAP of size K (one entry per run):
+
+    Initial heap: [run1.peek(), run2.peek(), run3.peek(), ...]
+
+    Loop:
+        min_row = heap.pop_minimum()
+        emit min_row to output
+        advance the run that min_row came from
+        push next row from that run into heap
+
+    Time: O(N log K)  where K = number of spill files
+    Memory: O(K) for the heap + O(1) per run (streaming read buffer)
+```
+
+### RadixSort (used internally for some aggregations)
+
+```
+What: Non-comparison sort on integer keys
+When: Sorting by integer join keys or hash values internally
+
+How:
+    Pass 1: Sort by least significant byte (0-255)
+    Pass 2: Sort by next byte
+    Pass 3: Sort by next byte
+    Pass 4: Sort by most significant byte (for 32-bit int = 4 passes)
+
+Each pass is O(N) → Total: O(N × bytes_in_key) = O(N) for fixed-width keys
+Much faster than O(N log N) for integer keys
+
+Used in: UnsafeExternalSorter when keys are fixed-width integers/longs
+```
+
+---
+
+## 🔵 MERGING STRATEGIES — Internal Details
+
+### Two-Way Merge (basic SMJ merge)
+
+```
+Used when: Only 2 sorted runs to merge (no spill, clean SMJ)
+
+left  = [1, 3, 3, 7, 9]   (sorted orders partition)
+right = [2, 3, 5, 8]      (sorted customers partition)
+
+ptr_L = 0, ptr_R = 0
+
+Step 1: left[0]=1, right[0]=2 → 1 < 2 → advance left
+Step 2: left[1]=3, right[0]=2 → 3 > 2 → advance right (no match for 2)
+Step 3: left[1]=3, right[1]=3 → MATCH → emit joined row
+            left has multiple 3s: check left[2]=3 → also 3 → emit another
+            right has only one 3: advance right
+Step 4: left[3]=7, right[2]=5 → 7 > 5 → advance right (no match for 5)
+...
+
+Time: O(N + M) — single linear scan of both sides
+Memory: O(1) — just two pointers + a small lookahead buffer for duplicates
+```
+
+### K-Way Merge (used when data spills to multiple files)
+
+```
+Used when: Task produced K spill files during sort phase
+
+K sorted spill files:
+    file_1: [1, 5, 9, 13]
+    file_2: [2, 4, 11, 15]
+    file_3: [3, 6, 8, 12]
+
+Min-heap with K=3 slots:
+    Initialize: heap = [(1,file1), (2,file2), (3,file3)]
+
+    Round 1: pop (1,file1) → emit 1 → push next from file1: (5,file1)
+             heap = [(2,file2), (3,file3), (5,file1)]
+    Round 2: pop (2,file2) → emit 2 → push next from file2: (4,file2)
+             heap = [(3,file3), (4,file2), (5,file1)]
+    Round 3: pop (3,file3) → emit 3 → push next from file3: (6,file3)
+             heap = [(4,file2), (5,file1), (6,file3)]
+    ...
+
+Output stream: 1, 2, 3, 4, 5, 6, 8, 9, 11, 12, 13, 15  ← fully sorted
+
+Time:   O(N log K)
+Memory: O(K) for heap — does NOT load all spill files into memory!
+        Only one element per file is in the heap at a time
+```
+
+### Partial Aggregation Merge (for groupBy + agg)
+
+```
+Used when: groupBy().agg() — two-phase aggregation
+
+Phase 1 — Map-side partial merge (BEFORE shuffle):
+    Each task builds a local hash map:
+    {
+        "Engineering" → (sum=170000, count=2),
+        "Marketing"   → (sum=70000,  count=1),
+    }
+    Reduces 1M rows → hundreds of partial aggregate rows
+    MUCH less data to shuffle
+
+Phase 2 — Reduce-side final merge (AFTER shuffle):
+    Each partition receives ALL partial aggregates for its keys
+    Merges them:
+    "Engineering":
+        partial_1: (sum=170000, count=2)
+        partial_2: (sum=150000, count=2)
+        partial_3: (sum=200000, count=3)
+        Merged:    (sum=520000, count=7) → avg = 74285.71
+
+Time:   O(N/P) where P = number of partitions
+Memory: O(distinct_keys_per_partition) for hash map
+```
+
+---
+
+## 🔵 JOIN STRATEGIES + SORT/MERGE COMBINATION TABLE
+
+```
+┌───────────────────────┬──────────┬──────────┬──────────┬────────────────────────┐
+│ Strategy              │ Shuffle? │ Sort?    │ Merge?   │ Best for               │
+├───────────────────────┼──────────┼──────────┼──────────┼────────────────────────┤
+│ BroadcastHashJoin     │ ❌ None  │ ❌ None  │ ❌ None  │ large + tiny (<10MB)   │
+│ ShuffleHashJoin       │ ✅ Both  │ ❌ None  │ Hash     │ large + medium         │
+│ SortMergeJoin         │ ✅ Both  │ ✅ Both  │ 2-way    │ large + large          │
+│ BroadcastNestedLoop   │ ❌ None  │ ❌ None  │ Nested   │ non-equi joins         │
+│ CartesianJoin         │ ❌ None  │ ❌ None  │ Nested   │ cross join (danger!)   │
+└───────────────────────┴──────────┴──────────┴──────────┴────────────────────────┘
+
+Sort types used internally:
+┌──────────────┬─────────────────────────────────────────────────────────────┐
+│ TimSort      │ In-memory, data fits in RAM, O(N log N)                     │
+│ External Sort│ Data > memory, multi-pass spill + K-way merge, O(N log K)  │
+│ RadixSort    │ Integer keys only, O(N), used in UnsafeExternalSorter       │
+└──────────────┴─────────────────────────────────────────────────────────────┘
+
+Merge types used internally:
+┌──────────────────────┬──────────────────────────────────────────────────────┐
+│ Two-way merge        │ SMJ with 2 sorted partitions, O(N+M), O(1) memory   │
+│ K-way merge          │ Multiple spill files, min-heap, O(N log K)          │
+│ Partial agg merge    │ groupBy aggregation, hash-map based, two-phase      │
+└──────────────────────┴──────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🔵 AQE — Runtime Join Strategy Switching
+
+With `spark.sql.adaptive.enabled = true` (default Spark 3.2+):
+
+```
+Planned at compile time:   SortMergeJoin
+                                │
+                         Stage 0 executes
+                                │
+                    AQE measures actual data sizes:
+                    "customers after filter = 4 MB"
+                                │
+                    4 MB < 10 MB threshold
+                                │
+                    AQE switches plan at runtime:
+                    SortMergeJoin → BroadcastHashJoin
+                                │
+                    Stage 1 uses BroadcastHashJoin instead
+                    Saves: one full shuffle + two full sorts
+
+This is why AQE is such a big deal — it catches cases where
+compile-time estimates were wrong due to filter selectivity
+```
+
+---
+
+## ⚠️ Common Mistakes
+
+```
+❌ Mistake 1: Broadcast threshold too low
+   symptom: always falls back to SMJ even for 15 MB tables
+   fix: spark.sql.autoBroadcastJoinThreshold = 52428800  (50 MB)
+
+❌ Mistake 2: Preferring SMJ when SHJ would be faster
+   symptom: unnecessary sort for medium-sized joins
+   fix: spark.sql.join.preferSortMergeJoin = false  (let optimizer choose)
+
+❌ Mistake 3: Data skew in SMJ
+   symptom: one task takes 100x longer (hot key problem)
+   fix: spark.sql.adaptive.skewJoin.enabled = true  (AQE handles it)
+   or:  manually salt the join key
+
+❌ Mistake 4: Accidental CartesianJoin
+   symptom: result has rows_A × rows_B rows — job never finishes
+   fix: always specify a join condition; enable
+        spark.sql.crossJoin.enabled = false  to catch mistakes
+```
+
+# Bucketing vs Salting
+
+
+# What is Cardinality, high cardinality vs low cardinality and partitioning stretegy on them?
+
+# Catalyst Analyzer, Catalyst Optimized, Filter Pushdown, prediction Pushdown, Cost estimation
+
+
+# 
+
+# SparkSession  vs SparkContext — Complete Deep Dive
+
+---
+
+## 📌 One-Line Summary
+
+| | SparkContext | SparkSession |
+|---|---|---|
+| **Introduced** | Spark 1.0 (2014) | Spark 2.0 (2016) |
+| **What it is** | Entry point to the **core Spark engine** (RDDs) | Unified entry point to **all of Spark** (RDD + SQL + Streaming + ML) |
+| **Analogy** | Raw engine of a car | Full car with dashboard, GPS, AC — and the engine inside |
+
+---
+
+## 🕰️ Historical Context — Why Both Exist
+
+### Spark 1.x Era (Before 2016)
+In early Spark, there were **multiple separate entry points** depending on what you wanted to do:
+
+```
+SparkContext     → for RDDs (core Spark)
+SQLContext       → for DataFrames / SQL
+HiveContext      → for Hive support
+StreamingContext → for Spark Streaming
+```
+
+This was painful. Developers had to manage multiple context objects, and they couldn't always share configurations or resources easily.
+
+### Spark 2.0 Era (2016 onward)
+Spark introduced **SparkSession** as a **single unified entry point** that wraps all of the above:
+
+```
+SparkSession
+    ├── SparkContext     (still exists inside)
+    ├── SQLContext       (wrapped inside)
+    ├── HiveContext      (wrapped inside)
+    └── SparkConf        (configuration unified)
+```
+
+> SparkContext did NOT go away — it still powers the low-level engine. SparkSession just wraps it.
+
+---
+
+## 🔬 What is SparkContext?
+
+### Definition
+`SparkContext` is the **original entry point** to Spark's core distributed computing engine. It is responsible for connecting your application to the Spark cluster.
+
+### What SparkContext Does Internally — Step by Step
+
+```
+Step 1: Reads SparkConf (configuration object)
+            ↓
+Step 2: Connects to the Cluster Manager
+        (Standalone / YARN / Mesos / Kubernetes)
+            ↓
+Step 3: Requests resources (CPU cores, memory) from Cluster Manager
+            ↓
+Step 4: Cluster Manager launches Executors on Worker nodes
+            ↓
+Step 5: SparkContext registers these Executors
+            ↓
+Step 6: Your application can now distribute work via RDDs
+```
+
+### What SparkContext Can Do
+- Create **RDDs** (Resilient Distributed Datasets)
+- Read files → `sc.textFile()`, `sc.wholeTextFiles()`
+- Create RDDs from collections → `sc.parallelize([1,2,3])`
+- Set log levels, broadcast variables, accumulators
+- Access cluster info → `sc.master`, `sc.appName`
+- Cancel jobs, manage job groups
+
+### How to Create SparkContext (Old Way — Spark 1.x style)
+
+```python
+from pyspark import SparkConf, SparkContext
+
+conf = SparkConf() \
+    .setAppName("MyApp") \
+    .setMaster("local[*]") \
+    .set("spark.executor.memory", "2g")
+
+sc = SparkContext(conf=conf)
+
+# Now use RDDs
+rdd = sc.parallelize([1, 2, 3, 4, 5])
+result = rdd.map(lambda x: x * 2).collect()
+print(result)  # [2, 4, 6, 8, 10]
+```
+
+### SparkContext Limitations
+- ❌ Cannot run SQL queries directly
+- ❌ Cannot create DataFrames or Datasets
+- ❌ No built-in Hive support
+- ❌ Only one SparkContext allowed per JVM at a time
+- ❌ No unified config with SQL or ML libraries
+
+---
+
+## 🚀 What is SparkSession?
+
+### Definition
+`SparkSession` is the **unified entry point** introduced in Spark 2.0. It consolidates SparkContext, SQLContext, and HiveContext into one object.
+
+### What SparkSession Does Internally — Step by Step
+
+```
+Step 1: You call SparkSession.builder
+            ↓
+Step 2: Builder checks if a SparkSession already exists (singleton pattern)
+            ↓
+Step 3: If not exists → creates SparkConf internally
+            ↓
+Step 4: Creates SparkContext internally (the engine)
+            ↓
+Step 5: Wraps SQLContext and HiveContext internally
+            ↓
+Step 6: Returns a fully configured SparkSession object
+            ↓
+Step 7: You can now use DataFrames, SQL, RDDs, ML — all from one object
+```
+
+### How to Create SparkSession (Modern Way — Spark 2.0+)
+
+```python
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder \
+    .appName("MyApp") \
+    .master("local[*]") \
+    .config("spark.executor.memory", "2g") \
+    .config("spark.sql.shuffle.partitions", "200") \
+    .enableHiveSupport() \   # optional
+    .getOrCreate()           # reuses existing session if already created
+```
+
+### What SparkSession Can Do
+- Everything SparkContext can do (via `spark.sparkContext`)
+- Create **DataFrames** → `spark.read.csv()`, `spark.read.parquet()`
+- Run **SQL queries** → `spark.sql("SELECT * FROM table")`
+- Create DataFrames from collections → `spark.createDataFrame(data, schema)`
+- Access **Hive metastore** (with `enableHiveSupport()`)
+- Manage **catalog** → `spark.catalog.listTables()`
+- Register **UDFs** (User Defined Functions)
+- Use **Spark Streaming**, **MLlib**, **GraphX** — all through one session
+
+---
+
+## 🔗 Relationship Between SparkSession and SparkContext
+
+This is the most important thing to understand:
+
+```
+SparkSession
+│
+├── .sparkContext  ← SparkContext lives INSIDE SparkSession
+│       │
+│       ├── Connects to Cluster Manager
+│       ├── Manages Executors
+│       ├── Manages RDD operations
+│       └── Is the actual low-level engine
+│
+├── .read          ← DataFrameReader (reads files into DataFrames)
+├── .sql()         ← Runs SQL queries
+├── .catalog       ← Manages tables, databases, functions
+└── .conf          ← Runtime configuration
+```
+
+### Accessing SparkContext from SparkSession
+
+```python
+spark = SparkSession.builder.appName("App").getOrCreate()
+
+# Access SparkContext from SparkSession
+sc = spark.sparkContext
+
+# Now use RDD operations
+rdd = sc.parallelize([1, 2, 3])
+print(rdd.collect())
+```
+
+> You should **never create a separate SparkContext** when using SparkSession. Just access it via `spark.sparkContext`.
+
+---
+
+## ⚖️ Side-by-Side Feature Comparison
+
+| Feature | SparkContext | SparkSession |
+|---|---|---|
+| Introduced in | Spark 1.0 | Spark 2.0 |
+| Primary abstraction | RDD | DataFrame / Dataset |
+| Create RDDs | ✅ Yes | ✅ Via `.sparkContext` |
+| Create DataFrames | ❌ No | ✅ Yes |
+| Run SQL queries | ❌ No | ✅ Yes |
+| Read CSV/JSON/Parquet | ❌ Limited | ✅ Yes (`.read`) |
+| Hive support | ❌ No | ✅ Yes (with flag) |
+| Broadcast variables | ✅ Yes | ✅ Via `.sparkContext` |
+| Accumulators | ✅ Yes | ✅ Via `.sparkContext` |
+| Multiple instances | ❌ Only 1 per JVM | ✅ Multiple (different sessions) |
+| Configuration | Via `SparkConf` | Via `.config()` builder |
+| Catalog management | ❌ No | ✅ Yes |
+| Used in production today | Rarely alone | ✅ Standard |
+
+---
+
+## 🧪 Code Comparison — Same Task, Two Ways
+
+### Task: Count lines in a file
+
+**Using SparkContext (RDD way)**
+```python
+from pyspark import SparkContext
+
+sc = SparkContext("local", "WordCount")
+lines = sc.textFile("data.txt")         # returns RDD
+count = lines.count()
+print(count)
+sc.stop()
+```
+
+**Using SparkSession (DataFrame way)**
+```python
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("WordCount").getOrCreate()
+df = spark.read.text("data.txt")        # returns DataFrame
+count = df.count()
+print(count)
+spark.stop()
+```
+
+---
+
+### Task: Word count
+
+**SparkContext / RDD way**
+```python
+sc = SparkContext("local", "WC")
+rdd = sc.textFile("data.txt") \
+        .flatMap(lambda line: line.split(" ")) \
+        .map(lambda word: (word, 1)) \
+        .reduceByKey(lambda a, b: a + b)
+print(rdd.collect())
+```
+
+**SparkSession / DataFrame way**
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import explode, split, col
+
+spark = SparkSession.builder.appName("WC").getOrCreate()
+df = spark.read.text("data.txt")
+result = df.select(explode(split(col("value"), " ")).alias("word")) \
+           .groupBy("word").count()
+result.show()
+```
+
+---
+
+## 🔑 The `getOrCreate()` Pattern — Singleton Behavior
+
+SparkSession uses a **singleton pattern**. If a session already exists, it reuses it instead of creating a new one.
+
+```python
+# First call — creates a new session
+spark1 = SparkSession.builder.appName("App1").getOrCreate()
+
+# Second call — returns the SAME session (does not create new)
+spark2 = SparkSession.builder.appName("App2").getOrCreate()
+
+print(spark1 is spark2)  # True — same object
+```
+
+This is important because:
+- Only **one SparkContext** can exist per JVM
+- SparkSession wraps that single SparkContext
+- `getOrCreate()` prevents accidental duplicate context errors
+
+---
+
+## 🏗️ Internal Architecture — What Happens When You Create SparkSession
+
+```
+SparkSession.builder.appName("App").master("local").getOrCreate()
+        │
+        ▼
+1. SparkSession.Builder collects all config
+        │
+        ▼
+2. Checks thread-local / global session registry
+        │
+        ├── Session exists? → Return existing session ✅
+        │
+        └── No session? → Continue
+                │
+                ▼
+        3. Create SparkConf from all .config() calls
+                │
+                ▼
+        4. Create SparkContext(conf)
+                │
+                ▼
+        5. SparkContext connects to Cluster Manager
+                │
+                ▼
+        6. Executors launched on workers
+                │
+                ▼
+        7. SQLContext / HiveContext initialized inside
+                │
+                ▼
+        8. SparkSession object returned to user ✅
+```
+
+---
+
+## ⚠️ Common Mistakes & Gotchas
+
+### ❌ Mistake 1: Creating SparkContext separately when SparkSession exists
+```python
+# WRONG — will throw error: "Cannot run multiple SparkContexts"
+spark = SparkSession.builder.getOrCreate()
+sc = SparkContext("local", "App")  # ❌ Error!
+
+# CORRECT
+spark = SparkSession.builder.getOrCreate()
+sc = spark.sparkContext  # ✅ Reuse the existing one
+```
+
+### ❌ Mistake 2: Forgetting to call stop()
+```python
+# Always stop your session when done (especially in scripts/tests)
+spark.stop()
+```
+
+### ❌ Mistake 3: Using SparkContext to read structured data
+```python
+# WRONG — clunky, loses schema info
+sc = SparkContext("local", "App")
+rdd = sc.textFile("data.csv")  # Just raw text lines
+
+# CORRECT — structured, typed, optimized
+spark = SparkSession.builder.getOrCreate()
+df = spark.read.csv("data.csv", header=True, inferSchema=True)  # ✅
+```
+
+### ❌ Mistake 4: Creating SparkSession in a loop
+```python
+# WRONG — wasteful, but won't error due to getOrCreate
+for i in range(10):
+    spark = SparkSession.builder.getOrCreate()  # creates only once, reuses rest
+
+# CORRECT — create once, reuse
+spark = SparkSession.builder.getOrCreate()
+for i in range(10):
+    # use spark here
+    pass
+```
+
+---
+
+## 🧠 When to Use What — Decision Guide
+
+```
+Do you need to work with structured data (CSV, JSON, Parquet, DB)?
+    → Use SparkSession (.read, DataFrame, SQL)
+
+Do you need to run SQL queries?
+    → Use SparkSession (.sql())
+
+Do you need fine-grained low-level control (custom partitioning, complex transformations)?
+    → Use SparkContext via spark.sparkContext → RDDs
+
+Are you maintaining legacy Spark 1.x code?
+    → SparkContext was required; consider migrating to SparkSession
+
+Do you need both RDDs and DataFrames?
+    → Use SparkSession, access RDDs via spark.sparkContext
+```
+
+---
+
+## 📦 Quick Reference Cheat Sheet
+
+```python
+# ✅ Modern standard way to start any Spark application
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder \
+    .appName("MyApp") \
+    .master("local[*]") \
+    .config("spark.sql.shuffle.partitions", "200") \
+    .getOrCreate()
+
+# Access SparkContext when needed for RDDs
+sc = spark.sparkContext
+
+# DataFrames
+df = spark.read.csv("file.csv", header=True, inferSchema=True)
+df.show()
+
+# SQL
+spark.sql("SELECT * FROM my_table").show()
+
+# RDD (when needed)
+rdd = sc.parallelize([1, 2, 3, 4])
+print(rdd.map(lambda x: x**2).collect())
+
+# Clean up
+spark.stop()
+```
+
+---
+
+## 🎯 Summary
+
+| Concept | Key Point |
+|---|---|
+| **SparkContext** | Low-level engine; connects to cluster; works with RDDs; existed since Spark 1.0 |
+| **SparkSession** | High-level unified API; wraps SparkContext; works with DataFrames, SQL, ML; since Spark 2.0 |
+| **Relationship** | SparkSession **contains** SparkContext — they are not alternatives, one wraps the other |
+| **Use today** | Always create `SparkSession`; access SparkContext via `spark.sparkContext` only when needed |
+| **getOrCreate()** | Singleton pattern — safe to call multiple times, won't create duplicate contexts |
+
+
+# Schedulers in Spark:
+https://moderndata101.substack.com/cp/188499149
+
+
+
+# RDD vs DataFrame — Complete Deep Dive
+
+---
+
+## 📌 One-Line Summary
+
+| | RDD | DataFrame |
+|---|---|---|
+| **Full Name** | Resilient Distributed Dataset | DataFrame |
+| **Introduced** | Spark 1.0 (2014) | Spark 1.3 (2015) |
+| **What it is** | Low-level distributed collection of **any Java/Python/Scala objects** | Distributed collection of **rows with a named, typed schema** (like a database table) |
+| **Analogy** | A distributed list of raw objects | A distributed Excel sheet / SQL table |
+
+---
+
+## 🕰️ Historical Context — Why Both Exist
+
+### Spark 1.0 — Only RDDs
+When Spark was born, the only abstraction was the RDD. It was powerful but:
+- No schema → no SQL support
+- No automatic optimization → slow for structured data
+- Very verbose code for simple operations
+
+### Spark 1.3 — DataFrames Introduced
+Spark borrowed the DataFrame concept from R/Pandas and added:
+- Schema (column names + types)
+- SQL query support
+- Catalyst Optimizer (automatic query optimization)
+- Tungsten execution engine (memory + CPU efficiency)
+
+### Spark 2.0+ — Datasets (Typed DataFrames)
+- Spark merged DataFrame into the **Dataset API**
+- `DataFrame = Dataset[Row]` (a Dataset where each row is an untyped Row object)
+- In PySpark, you mostly use DataFrame; in Scala/Java, you can use typed Datasets
+
+---
+
+## 🔬 What is an RDD?
+
+### Definition
+An RDD (Resilient Distributed Dataset) is Spark's **fundamental low-level data structure**. It represents an **immutable, partitioned collection of records** distributed across the cluster that can be operated on in parallel.
+
+### Breaking Down the Name
+
+```
+R — Resilient   → Fault-tolerant: if a partition is lost, Spark can recompute it
+                  using the lineage graph (DAG of transformations)
+
+D — Distributed → Data is split into partitions spread across multiple nodes
+
+D — Dataset     → A collection of data records (any type: String, Int, custom objects)
+```
+
+### RDD Internal Structure
+
+```
+RDD[T]
+│
+├── Partition 1  → lives on Worker Node 1  (subset of data)
+├── Partition 2  → lives on Worker Node 2  (subset of data)
+├── Partition 3  → lives on Worker Node 3  (subset of data)
+└── Partition N  → lives on Worker Node N  (subset of data)
+│
+├── Lineage Graph (DAG) → how to recompute lost partitions
+├── Partitioner          → how data is distributed (hash / range / none)
+├── Dependencies         → narrow or wide (shuffle)
+└── Preferred locations  → data locality hints
+```
+
+### Key Properties of RDD
+
+**1. Immutable**
+Once created, an RDD cannot be modified. Every transformation creates a new RDD.
+
+```python
+rdd1 = sc.parallelize([1, 2, 3, 4, 5])
+rdd2 = rdd1.map(lambda x: x * 2)   # new RDD, rdd1 is unchanged
+rdd3 = rdd2.filter(lambda x: x > 4) # another new RDD
+```
+
+**2. Lazy Evaluation**
+Transformations are NOT executed immediately. Spark builds a DAG (Directed Acyclic Graph) of operations and only executes when an **action** is called.
+
+```python
+# Nothing executes here — just building the DAG
+rdd = sc.parallelize([1, 2, 3, 4, 5])
+rdd = rdd.map(lambda x: x * 2)
+rdd = rdd.filter(lambda x: x > 4)
+
+# THIS triggers execution
+result = rdd.collect()  # ← Action — now Spark runs everything
+```
+
+**3. Fault-Tolerant via Lineage**
+```
+If Partition 3 is lost (worker crash):
+    Spark looks at lineage:
+    sc.parallelize([...]) → .map(x*2) → .filter(x>4)
+    Spark recomputes only Partition 3 from scratch
+    No need to re-run the entire job
+```
+
+**4. Type Safety (in a way)**
+RDDs are typed: `RDD[Int]`, `RDD[String]`, `RDD[(String, Int)]`. The type is known at compile time (Scala/Java) but not enforced at runtime in Python.
+
+---
+
+## 📊 What is a DataFrame?
+
+### Definition
+A DataFrame is a **distributed collection of data organized into named columns**, similar to a table in a relational database or a spreadsheet. It is built on top of RDDs but adds **schema awareness** and **query optimization**.
+
+### DataFrame Internal Structure
+
+```
+DataFrame
+│
+├── Schema
+│       ├── Column: "name"       → StringType
+│       ├── Column: "age"        → IntegerType
+│       └── Column: "department" → StringType
+│
+├── Partitions (internally still RDD[Row] under the hood)
+│       ├── Partition 1 → Row("Alice", 30, "Engineering")
+│       ├── Partition 2 → Row("Bob", 25, "Marketing")
+│       └── Partition N → Row(...)
+│
+├── Catalyst Optimizer   → optimizes your query plan
+└── Tungsten Engine      → optimized memory & CPU execution
+```
+
+### How DataFrame is Created
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+spark = SparkSession.builder.appName("App").getOrCreate()
+
+# Method 1: From a list
+data = [("Alice", 30, "Engineering"),
+        ("Bob",   25, "Marketing"),
+        ("Carol", 35, "Engineering")]
+
+schema = StructType([
+    StructField("name",       StringType(),  True),
+    StructField("age",        IntegerType(), True),
+    StructField("department", StringType(),  True)
+])
+
+df = spark.createDataFrame(data, schema)
+df.show()
+# +-----+---+-----------+
+# | name|age| department|
+# +-----+---+-----------+
+# |Alice| 30|Engineering|
+# |  Bob| 25|  Marketing|
+# |Carol| 35|Engineering|
+# +-----+---+-----------+
+
+# Method 2: From a file
+df = spark.read.csv("employees.csv", header=True, inferSchema=True)
+
+# Method 3: From SQL
+spark.sql("SELECT * FROM employees").show()
+```
+
+---
+
+## ⚙️ How RDD Works Internally — Step by Step
+
+### Step 1: Creation
+```python
+sc = spark.sparkContext
+rdd = sc.parallelize([1, 2, 3, 4, 5, 6, 7, 8], numSlices=4)
+```
+```
+Data split into 4 partitions:
+Partition 0: [1, 2]
+Partition 1: [3, 4]
+Partition 2: [5, 6]
+Partition 3: [7, 8]
+```
+
+### Step 2: Transformation (Lazy — builds DAG)
+```python
+rdd2 = rdd.map(lambda x: x * 2)
+rdd3 = rdd2.filter(lambda x: x > 6)
+```
+```
+DAG built (nothing executed yet):
+parallelize → map(x*2) → filter(x>6)
+```
+
+### Step 3: Action (Triggers Execution)
+```python
+result = rdd3.collect()
+```
+```
+Spark submits job to cluster:
+
+Partition 0: [1,2] → map → [2,4] → filter → []
+Partition 1: [3,4] → map → [6,8] → filter → [8]
+Partition 2: [5,6] → map → [10,12] → filter → [10,12]
+Partition 3: [7,8] → map → [14,16] → filter → [14,16]
+
+collect() gathers results to driver:
+→ [8, 10, 12, 14, 16]
+```
+
+### Step 4: Fault Recovery (if needed)
+```
+If Partition 2 fails mid-execution:
+    Spark reads lineage:
+    sc.parallelize([5,6]) → map(x*2) → filter(x>6)
+    Recomputes only Partition 2 on another worker
+    Job continues without full restart
+```
+
+---
+
+## ⚙️ How DataFrame Works Internally — Step by Step
+
+### Step 1: Query Plan Creation (Unresolved Logical Plan)
+```python
+df = spark.read.csv("employees.csv", header=True, inferSchema=True)
+result = df.filter(df.age > 30).groupBy("department").count()
+```
+```
+Spark creates an Unresolved Logical Plan:
+    Read CSV
+        → Filter(age > 30)
+            → GroupBy(department)
+                → Count()
+```
+
+### Step 2: Analysis (Resolved Logical Plan)
+```
+Catalyst Analyzer checks:
+    - Does column "age" exist? ✅
+    - Is "age" the right type for > 30? ✅ (IntegerType)
+    - Does column "department" exist? ✅
+Unresolved plan → Resolved Logical Plan
+```
+
+### Step 3: Optimization (Optimized Logical Plan)
+```
+Catalyst Optimizer applies rules:
+
+Rule: Predicate Pushdown
+    → Push filter(age > 30) as close to data source as possible
+    → Filter applied while reading CSV, not after loading everything
+
+Rule: Column Pruning
+    → Only read columns "age" and "department"
+    → Skip "name" column entirely (not needed)
+
+Rule: Constant Folding, etc.
+
+Resolved Plan → Optimized Logical Plan
+```
+
+### Step 4: Physical Planning
+```
+Spark generates multiple Physical Plans:
+    Plan A: BroadcastHashJoin
+    Plan B: SortMergeJoin
+    Plan C: ShuffleHashJoin
+
+Cost-based optimizer picks the cheapest plan
+→ Best Physical Plan selected
+```
+
+### Step 5: Code Generation (Tungsten)
+```
+Tungsten generates optimized Java bytecode at runtime
+    → No Python overhead per row
+    → CPU cache-friendly execution
+    → Operates on binary data directly (avoids Java object overhead)
+```
+
+### Step 6: Execution
+```
+Physical Plan executed as RDD operations under the hood
+Results returned to user
+```
+
+---
+
+## 🔁 RDD vs DataFrame — Internal Execution Flow Comparison
+
+```
+RDD Execution:
+──────────────
+Your Python Code
+    ↓
+Python closures sent to JVM
+    ↓
+Spark executes row by row
+    ↓
+NO optimization
+    ↓
+Result
+
+DataFrame Execution:
+────────────────────
+Your Python Code
+    ↓
+Logical Plan built
+    ↓
+Catalyst Optimizer (many optimization passes)
+    ↓
+Physical Plan chosen
+    ↓
+Tungsten generates JVM bytecode
+    ↓
+Highly optimized execution
+    ↓
+Result
+```
+
+> ✅ This is why DataFrames are usually **2x–10x faster** than equivalent RDD code.
+
+---
+
+## ⚖️ Side-by-Side Feature Comparison
+
+| Feature | RDD | DataFrame |
+|---|---|---|
+| Introduced | Spark 1.0 | Spark 1.3 |
+| Data model | Distributed objects (any type) | Distributed rows with named columns |
+| Schema | ❌ No schema | ✅ Named columns + data types |
+| Type safety | Partial (generic types) | Column-level type checking |
+| SQL support | ❌ No | ✅ Yes — `spark.sql()` |
+| Optimization | ❌ None — runs as-is | ✅ Catalyst optimizer |
+| Performance | Slower (especially in PySpark) | Faster (Tungsten + Catalyst) |
+| Memory usage | Higher (Java objects) | Lower (binary columnar format) |
+| Ease of use | Verbose, functional style | Concise, SQL-like style |
+| Debugging | Easier — explicit steps | Harder — optimizer transforms plan |
+| Serialization | Java/Kryo serialization | Binary Tungsten format (no serialization overhead) |
+| Custom objects | ✅ Yes — any Python/Java object | ❌ No — only Row types |
+| Fault tolerance | ✅ Via lineage | ✅ Via lineage (same mechanism) |
+| Unstructured data | ✅ Best choice | ❌ Not suitable |
+| Structured data | ❌ Verbose | ✅ Best choice |
+| Streaming support | DStream (legacy) | Structured Streaming (modern) |
+
+---
+
+## 🧪 Code Comparison — Same Tasks, Two Ways
+
+### Task 1: Filter employees older than 30
+
+**RDD way**
+```python
+# Assuming data as list of tuples: (name, age, department)
+rdd = sc.parallelize([
+    ("Alice", 30, "Engineering"),
+    ("Bob",   25, "Marketing"),
+    ("Carol", 35, "Engineering"),
+    ("Dave",  40, "HR")
+])
+
+result = rdd.filter(lambda row: row[1] > 30).collect()
+# [('Carol', 35, 'Engineering'), ('Dave', 40, 'HR')]
+```
+- No column names — you use index `row[1]` for age
+- Easy to make mistakes (wrong index)
+- No schema validation
+
+**DataFrame way**
+```python
+df = spark.createDataFrame([
+    ("Alice", 30, "Engineering"),
+    ("Bob",   25, "Marketing"),
+    ("Carol", 35, "Engineering"),
+    ("Dave",  40, "HR")
+], ["name", "age", "department"])
+
+result = df.filter(df.age > 30)
+result.show()
+# +-----+---+-----------+
+# | name|age| department|
+# +-----+---+-----------+
+# |Carol| 35|Engineering|
+# | Dave| 40|         HR|
+# +-----+---+-----------+
+```
+- Named columns — readable, self-documenting
+- Schema enforced — wrong column name throws clear error
+
+---
+
+### Task 2: Count employees by department
+
+**RDD way**
+```python
+rdd = sc.parallelize([
+    ("Alice", 30, "Engineering"),
+    ("Bob",   25, "Marketing"),
+    ("Carol", 35, "Engineering"),
+    ("Dave",  40, "HR")
+])
+
+result = rdd \
+    .map(lambda row: (row[2], 1)) \          # extract department, emit 1
+    .reduceByKey(lambda a, b: a + b) \        # sum by department
+    .collect()
+
+# [('Engineering', 2), ('Marketing', 1), ('HR', 1)]
+```
+
+**DataFrame way**
+```python
+result = df.groupBy("department").count()
+result.show()
+# +-----------+-----+
+# | department|count|
+# +-----------+-----+
+# |Engineering|    2|
+# |  Marketing|    1|
+# |         HR|    1|
+# +-----------+-----+
+```
+
+---
+
+### Task 3: Average age per department, only departments with avg > 28
+
+**RDD way** (much more verbose)
+```python
+result = rdd \
+    .map(lambda row: (row[2], (row[1], 1))) \        # (dept, (age, count))
+    .reduceByKey(lambda a, b: (a[0]+b[0], a[1]+b[1])) \ # sum age and count
+    .mapValues(lambda v: v[0] / v[1]) \               # compute average
+    .filter(lambda row: row[1] > 28) \                # filter avg > 28
+    .collect()
+
+# [('Engineering', 32.5), ('HR', 40.0)]
+```
+
+**DataFrame way**
+```python
+from pyspark.sql.functions import avg
+
+result = df.groupBy("department") \
+           .agg(avg("age").alias("avg_age")) \
+           .filter("avg_age > 28")
+result.show()
+# +-----------+-------+
+# | department|avg_age|
+# +-----------+-------+
+# |Engineering|   32.5|
+# |         HR|   40.0|
+# +-----------+-------+
+```
+
+---
+
+### Task 4: SQL query on DataFrame (impossible with RDD)
+
+```python
+# Register DataFrame as a temp view
+df.createOrReplaceTempView("employees")
+
+# Run SQL directly
+result = spark.sql("""
+    SELECT department,
+           COUNT(*)    AS headcount,
+           AVG(age)    AS avg_age,
+           MAX(age)    AS max_age
+    FROM employees
+    WHERE age > 25
+    GROUP BY department
+    HAVING COUNT(*) > 0
+    ORDER BY avg_age DESC
+""")
+result.show()
+```
+> ❌ This is completely impossible with RDDs alone.
+
+---
+
+### Task 5: Working with custom objects (RDD wins here)
+
+```python
+# Custom Python class — ONLY works with RDD
+class Employee:
+    def __init__(self, name, age, department):
+        self.name = name
+        self.age = age
+        self.department = department
+    
+    def get_seniority(self):
+        return "Senior" if self.age > 30 else "Junior"
+
+employees = [
+    Employee("Alice", 30, "Engineering"),
+    Employee("Bob",   25, "Marketing"),
+    Employee("Carol", 35, "Engineering")
+]
+
+rdd = sc.parallelize(employees)
+seniors = rdd.filter(lambda e: e.get_seniority() == "Senior") \
+             .map(lambda e: e.name) \
+             .collect()
+# ['Carol']
+```
+> ✅ RDDs can hold any Python object. DataFrames cannot — they only understand structured Row types.
+
+---
+
+## 🔄 Converting Between RDD and DataFrame
+
+### RDD → DataFrame
+```python
+from pyspark.sql import Row
+
+# Method 1: Using Row objects
+rdd = sc.parallelize([
+    Row(name="Alice", age=30, department="Engineering"),
+    Row(name="Bob",   age=25, department="Marketing")
+])
+df = spark.createDataFrame(rdd)
+df.show()
+
+# Method 2: Using toDF() with column names
+rdd = sc.parallelize([("Alice", 30), ("Bob", 25)])
+df = rdd.toDF(["name", "age"])
+df.show()
+
+# Method 3: Using createDataFrame with schema
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+schema = StructType([
+    StructField("name", StringType(), True),
+    StructField("age",  IntegerType(), True)
+])
+rdd = sc.parallelize([("Alice", 30), ("Bob", 25)])
+df = spark.createDataFrame(rdd, schema)
+```
+
+### DataFrame → RDD
+```python
+df = spark.createDataFrame([("Alice", 30), ("Bob", 25)], ["name", "age"])
+
+# Get RDD of Row objects
+rdd_rows = df.rdd
+print(rdd_rows.first())   # Row(name='Alice', age=30)
+
+# Access fields by name
+rdd_names = df.rdd.map(lambda row: row["name"])
+print(rdd_names.collect())  # ['Alice', 'Bob']
+
+# Or by attribute
+rdd_ages = df.rdd.map(lambda row: row.age)
+print(rdd_ages.collect())   # [30, 25]
+```
+
+---
+
+## 🚀 Performance Deep Dive
+
+### Why DataFrames Are Faster Than RDDs in PySpark
+
+**RDD in PySpark — The Serialization Problem:**
+```
+Python process                     JVM (Spark)
+──────────────                     ───────────
+Python object                        
+    ↓ serialize (pickle)             
+Bytes ─────────────────────────→ Bytes
+                                     ↓ deserialize
+                               Java object
+                                     ↓ process
+                               Java object
+                                     ↓ serialize
+Bytes ←──────────────────────── Bytes
+    ↓ deserialize (pickle)
+Python object
+
+Every single row crosses the Python↔JVM boundary = VERY SLOW
+```
+
+**DataFrame in PySpark — No Serialization:**
+```
+Python process                     JVM (Spark)
+──────────────                     ───────────
+DataFrame API call ─────────────→ Logical Plan
+(just metadata,                        ↓
+ no data moves)                   Catalyst Optimizer
+                                       ↓
+                                  Physical Plan
+                                       ↓
+                                  Tungsten (binary data)
+                                       ↓ process in JVM
+                                  Result
+                                       ↓
+Result ←───────────────────────── Minimal data transfer
+
+Data NEVER leaves JVM. Python only sends instructions.
+```
+
+### Benchmark Comparison (approximate)
+
+| Operation | RDD | DataFrame | Speedup |
+|---|---|---|---|
+| Filter | 100s | 10s | ~10x |
+| GroupBy + Agg | 200s | 15s | ~13x |
+| Join | 500s | 30s | ~16x |
+| Sort | 150s | 12s | ~12x |
+
+> Numbers are illustrative — actual speedup depends on cluster size, data size, and operation complexity.
+
+---
+
+## 🧠 Catalyst Optimizer — What It Does for DataFrames
+
+```
+Original Query:
+df.filter(df.age > 30)
+  .select("name", "department")
+  .groupBy("department")
+  .count()
+
+Without Optimization:
+1. Read ALL columns from disk
+2. Load ALL rows into memory
+3. Filter age > 30
+4. Select only name, department
+5. GroupBy + count
+
+With Catalyst Optimization:
+1. Column Pruning     → Only read "age", "name", "department" from disk (skip others)
+2. Predicate Pushdown → Apply filter(age > 30) at data source level
+3. Partition Pruning  → Skip entire partitions where age ≤ 30 (if partitioned)
+4. GroupBy + count on already-filtered, already-pruned data
+
+Result: Much less I/O, much less memory, much faster
+```
+
+---
+
+## 🏗️ Narrow vs Wide Transformations (Applies to Both RDD & DataFrame)
+
+### Narrow Transformation (no shuffle)
+Each input partition contributes to exactly one output partition.
+
+```
+RDD Examples:    map(), filter(), flatMap(), mapPartitions()
+DataFrame Examples: select(), filter(), withColumn()
+
+Partition 1 → Partition 1 (same node, no data movement)
+Partition 2 → Partition 2
+Partition 3 → Partition 3
+```
+
+### Wide Transformation (shuffle — data moves across network)
+Input partitions contribute to multiple output partitions.
+
+```
+RDD Examples:    groupByKey(), reduceByKey(), join(), sortBy()
+DataFrame Examples: groupBy(), join(), orderBy(), distinct()
+
+Partition 1 ──→ Partition 1 (reshuffled)
+Partition 2 ──→ Partition 2 (reshuffled)
+Partition 3 ──→ Partition 3 (reshuffled)
+         ↑
+  Data moves across network = expensive
+```
+
+---
+
+## 🔑 Transformations vs Actions — Quick Reference
+
+### RDD
+
+| Category | Operation | Description |
+|---|---|---|
+| **Transformation** | `map(f)` | Apply function to each element |
+| **Transformation** | `filter(f)` | Keep elements where f returns True |
+| **Transformation** | `flatMap(f)` | Map then flatten |
+| **Transformation** | `reduceByKey(f)` | Reduce values by key (wide) |
+| **Transformation** | `groupByKey()` | Group values by key (wide) |
+| **Transformation** | `sortBy(f)` | Sort by key (wide) |
+| **Transformation** | `join(other)` | Join two RDDs (wide) |
+| **Action** | `collect()` | Return all elements to driver |
+| **Action** | `count()` | Return number of elements |
+| **Action** | `first()` | Return first element |
+| **Action** | `take(n)` | Return first n elements |
+| **Action** | `saveAsTextFile(path)` | Write to disk |
+| **Action** | `reduce(f)` | Aggregate all elements |
+
+### DataFrame
+
+| Category | Operation | Description |
+|---|---|---|
+| **Transformation** | `select(cols)` | Select columns |
+| **Transformation** | `filter(condition)` | Filter rows |
+| **Transformation** | `withColumn(name, expr)` | Add/replace column |
+| **Transformation** | `groupBy(cols)` | Group rows (wide) |
+| **Transformation** | `join(other, on, how)` | Join DataFrames (wide) |
+| **Transformation** | `orderBy(cols)` | Sort rows (wide) |
+| **Transformation** | `distinct()` | Remove duplicates (wide) |
+| **Transformation** | `drop(cols)` | Remove columns |
+| **Action** | `show(n)` | Print first n rows |
+| **Action** | `collect()` | Return all rows to driver |
+| **Action** | `count()` | Return row count |
+| **Action** | `write.csv(path)` | Write to disk |
+| **Action** | `toPandas()` | Convert to Pandas DataFrame |
+
+---
+
+## ✅ When to Use RDD vs DataFrame — Decision Guide
+
+```
+Is your data UNSTRUCTURED (raw text, binary, custom objects)?
+    → Use RDD
+
+Do you need to use CUSTOM PYTHON CLASSES or complex objects?
+    → Use RDD
+
+Are you doing COMPLEX LOW-LEVEL transformations not expressible in SQL/DSL?
+    → Use RDD
+
+Are you working with MACHINE LEARNING pipelines (MLlib)?
+    → Use DataFrame (most MLlib APIs require DataFrames now)
+
+Is your data STRUCTURED (CSV, JSON, Parquet, DB tables)?
+    → Use DataFrame
+
+Do you want to run SQL QUERIES?
+    → Use DataFrame
+
+Do you care about PERFORMANCE (most cases)?
+    → Use DataFrame
+
+Are you maintaining LEGACY Spark 1.x code?
+    → RDD was required; migrate to DataFrame when possible
+
+Do you need BOTH?
+    → Use DataFrame; convert to RDD only when necessary via .rdd
+```
+
+---
+
+## ⚠️ Common Mistakes & Gotchas
+
+### ❌ Mistake 1: Using groupByKey() instead of reduceByKey() in RDDs
+```python
+# WRONG — groupByKey shuffles ALL values across network first
+rdd.groupByKey().mapValues(sum)
+
+# CORRECT — reduceByKey does partial aggregation before shuffle
+rdd.reduceByKey(lambda a, b: a + b)
+```
+
+### ❌ Mistake 2: Calling collect() on large DataFrames/RDDs
+```python
+# WRONG — brings ALL data to driver → OutOfMemoryError
+result = df.collect()
+
+# CORRECT — only bring what you need
+result = df.limit(100).collect()
+result = df.show(20)
+```
+
+### ❌ Mistake 3: Using RDD when DataFrame is available
+```python
+# WRONG — slow, verbose, no optimization
+rdd = df.rdd.map(lambda row: (row["department"], 1)) \
+            .reduceByKey(lambda a, b: a + b)
+
+# CORRECT — fast, concise, optimized
+df.groupBy("department").count()
+```
+
+### ❌ Mistake 4: Not caching when reusing an RDD/DataFrame multiple times
+```python
+# WRONG — Spark recomputes from scratch each time
+for i in range(5):
+    print(df.count())  # reads CSV from disk 5 times!
+
+# CORRECT — cache in memory after first computation
+df.cache()  # or df.persist()
+for i in range(5):
+    print(df.count())  # reads from memory — fast
+```
+
+---
+
+## 📦 Quick Reference Cheat Sheet
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, avg, count, max, min
+
+spark = SparkSession.builder.appName("App").getOrCreate()
+sc = spark.sparkContext
+
+# ─── RDD ───────────────────────────────────────────────────────
+rdd = sc.parallelize([("Alice", 30, "Eng"),
+                      ("Bob",   25, "Mkt"),
+                      ("Carol", 35, "Eng")])
+
+rdd.map(lambda x: x[0]).collect()               # names
+rdd.filter(lambda x: x[1] > 28).collect()       # age > 28
+rdd.map(lambda x: (x[2], 1)) \
+   .reduceByKey(lambda a, b: a+b).collect()      # count by dept
+
+# ─── DataFrame ─────────────────────────────────────────────────
+df = spark.createDataFrame(
+    [("Alice", 30, "Eng"), ("Bob", 25, "Mkt"), ("Carol", 35, "Eng")],
+    ["name", "age", "department"]
+)
+
+df.select("name").show()                         # names
+df.filter(col("age") > 28).show()               # age > 28
+df.groupBy("department").count().show()          # count by dept
+df.groupBy("department").agg(
+    avg("age").alias("avg_age"),
+    max("age").alias("max_age")
+).show()
+
+# SQL
+df.createOrReplaceTempView("emp")
+spark.sql("SELECT department, COUNT(*) FROM emp GROUP BY department").show()
+
+# Convert
+df_from_rdd = rdd.toDF(["name", "age", "department"])
+rdd_from_df  = df.rdd
+
+spark.stop()
+```
+
+---
+
+## 🎯 Summary
+
+| Concept | RDD | DataFrame |
+|---|---|---|
+| **Level** | Low-level, functional | High-level, declarative |
+| **Best for** | Unstructured data, custom objects, complex logic | Structured data, SQL, analytics |
+| **Performance** | Slower (especially Python) | Faster (Catalyst + Tungsten) |
+| **Optimization** | None — runs exactly as coded | Automatic (query rewriting, predicate pushdown, column pruning) |
+| **Schema** | None | Named columns + types |
+| **SQL** | No | Yes |
+| **Fault tolerance** | Lineage graph | Lineage graph (same) |
+| **Use today** | When you must; niche use cases | Standard for 95% of use cases |
+| **Relationship** | DataFrame is built ON TOP of RDD | DataFrame internally uses RDD[Row] |
+
+
+# Where does RDD come into picture when we do any pyspark action?
+
+DataFrame Full Lifecycle — Complete Under-the-Hood Deep Dive
+
+---
+
+## 📌 The Big Picture — What Happens When You Write DataFrame Code
+
+```python
+df1 = spark.read.csv("employees.csv", header=True, inferSchema=True)
+df2 = spark.read.csv("departments.csv", header=True, inferSchema=True)
+result = df1.join(df2, "dept_id") \
+            .filter(col("age") > 30) \
+            .groupBy("department") \
+            .agg(avg("salary").alias("avg_salary")) \
+            .orderBy("avg_salary", ascending=False)
+result.write.parquet("output/")
+```
+
+Most people think this runs line by line. **It does NOT.**
+
+Here is what actually happens — all 10 phases:
+
+```
+Phase 1:  SparkSession reads file metadata (NO data loaded yet)
+Phase 2:  Each transformation builds a Logical Plan (NO execution)
+Phase 3:  Catalyst Analyzer resolves columns and types
+Phase 4:  Catalyst Optimizer rewrites the plan (predicate pushdown, etc.)
+Phase 5:  Physical Planner generates multiple execution strategies
+Phase 6:  Cost-based optimizer picks the best physical plan
+Phase 7:  Tungsten generates optimized JVM bytecode
+Phase 8:  Spark converts plan into RDD DAG (HERE is where RDD appears)
+Phase 9:  Job submitted — Stages, Tasks, Shuffle executed on cluster
+Phase 10: Failure detection and recovery if anything goes wrong
+```
+
+---
+
+## 🔵 PHASE 1 — Reading the File (No Data Loaded Yet)
+
+```python
+df1 = spark.read.csv("employees.csv", header=True, inferSchema=True)
+```
+
+### What actually happens here — step by step:
+
+```
+Step 1: Spark talks to the filesystem (HDFS / S3 / local)
+            → Reads file METADATA only (file size, block locations)
+            → Does NOT load any actual rows into memory
+
+Step 2: inferSchema=True triggers a SCHEMA INFERENCE JOB
+            → Spark reads a SAMPLE of the file (first few rows or entire file
+              depending on config)
+            → Determines column names and data types
+            → e.g., "age" → IntegerType, "name" → StringType, "salary" → DoubleType
+
+Step 3: Spark calculates how many partitions to create:
+            partition_count = ceil(file_size / spark.sql.files.maxPartitionBytes)
+            Default maxPartitionBytes = 128MB
+
+            Example:
+            File = 512MB → 512/128 = 4 partitions planned
+
+Step 4: An UNRESOLVED LOGICAL PLAN is created:
+            Relation[employees.csv]
+                Schema: (name: String, age: Int, dept_id: String, salary: Double)
+                Partitions: 4 (planned, not yet read)
+
+Step 5: df1 is just a PLAN OBJECT — no data, no RDD, nothing in memory
+```
+
+> ⚠️ **Key insight:** `df1` is NOT data. It is a RECIPE describing how to get data.
+
+---
+
+## 🔵 PHASE 2 — Building the Logical Plan (Every Transformation)
+
+Every time you call `.join()`, `.filter()`, `.groupBy()`, `.agg()`, `.orderBy()` — **nothing executes**. Spark just adds a node to the Logical Plan tree.
+
+```python
+df1 = spark.read.csv("employees.csv", header=True, inferSchema=True)
+df2 = spark.read.csv("departments.csv", header=True, inferSchema=True)
+
+joined   = df1.join(df2, "dept_id")           # adds Join node
+filtered = joined.filter(col("age") > 30)     # adds Filter node
+grouped  = filtered.groupBy("department")      # adds Aggregate node
+result   = grouped.agg(avg("salary").alias("avg_salary"))
+ordered  = result.orderBy("avg_salary", ascending=False)  # adds Sort node
+```
+
+### Logical Plan Tree (Unresolved)
+
+```
+Sort [avg_salary DESC]
+    └── Aggregate [department] → avg(salary) AS avg_salary
+            └── Filter [age > 30]
+                    └── Join [dept_id == dept_id]
+                            ├── Relation[employees.csv]   (left)
+                            └── Relation[departments.csv] (right)
+```
+
+- This tree is built **top-down as you write code**
+- Each node holds the operation and its inputs
+- Nothing is executed — this is pure metadata
+
+---
+
+## 🔵 PHASE 3 — Catalyst Analyzer (Resolving the Plan)
+
+When an **action** is finally called (e.g., `.write`, `.show()`, `.count()`), Spark sends the Unresolved Logical Plan to the **Catalyst Analyzer**.
+
+### What the Analyzer Does
+
+```
+Step 1: Checks the Catalog
+            → Catalog stores table names, column names, data types
+            → Is "age" a real column in df1? ✅
+            → Is "dept_id" present in both DataFrames? ✅
+            → Is "department" in df2? ✅
+            → Is "salary" a numeric type for avg()? ✅
+
+Step 2: Resolves column references
+            → Unresolved: col("age")
+            → Resolved:   employees.age#12 (IntegerType, nullable=true)
+            (each column gets a unique internal ID like #12, #13, etc.)
+
+Step 3: Resolves functions
+            → avg("salary") → avg(employees.salary#15: DoubleType)
+
+Step 4: Type coercion
+            → If you compare IntegerType > LongType, Spark widens to LongType
+
+Step 5: Output: Resolved Logical Plan
+```
+
+### Resolved Logical Plan
+
+```
+Sort [avg_salary#20 DESC]
+    └── Aggregate [department#18]
+              agg: avg(salary#15) AS avg_salary#20
+            └── Filter [age#12 > 30]
+                    └── Join [dept_id#13 == dept_id#17]
+                            ├── Relation[name#11, age#12, dept_id#13, salary#15]
+                            └── Relation[dept_id#17, department#18, location#19]
+```
+
+---
+
+## 🔵 PHASE 4 — Catalyst Optimizer (The Magic)
+
+This is the **most powerful phase**. The Catalyst Optimizer applies **rule-based transformations** to rewrite the logical plan into a more efficient one.
+
+### Optimization Rule 1: Predicate Pushdown
+
+```
+BEFORE optimization:
+    Read ALL rows from employees.csv
+        → Join with departments.csv
+            → THEN filter age > 30
+
+AFTER optimization (Predicate Pushdown):
+    Read employees.csv BUT filter age > 30 WHILE reading
+        → Join only the already-filtered rows
+            → Much less data in the join
+
+Result: If 70% of employees are age ≤ 30, the join processes 70% less data
+```
+
+### Optimization Rule 2: Column Pruning
+
+```
+BEFORE optimization:
+    Read ALL columns: name, age, dept_id, salary, address, phone, email, ...
+
+AFTER optimization (Column Pruning):
+    Only read: age, dept_id, salary, department
+    (only columns actually used in the final result)
+
+Result: Less I/O, less memory, faster scans
+```
+
+### Optimization Rule 3: Join Reordering
+
+```
+BEFORE:
+    employees (10M rows) JOIN departments (50 rows)
+
+AFTER (Join Reordering):
+    Filter employees to age > 30 first → maybe 3M rows
+    THEN join with departments (50 rows)
+
+Result: Join processes 7M fewer rows
+```
+
+### Optimization Rule 4: Constant Folding
+
+```
+BEFORE: filter(col("age") > 10 + 20)
+AFTER:  filter(col("age") > 30)
+
+Result: Expression evaluated once at planning time, not per row
+```
+
+### Optimization Rule 5: Broadcast Join Detection
+
+```
+If departments.csv is small (< spark.sql.autoBroadcastJoinThreshold, default 10MB):
+    → Mark it for BROADCAST
+    → Entire departments table sent to ALL executor nodes
+    → No shuffle needed for the join at all
+
+Result: Massive performance gain — join becomes local to each executor
+```
+
+### Optimized Logical Plan
+
+```
+Sort [avg_salary DESC]
+    └── Aggregate [department]
+            └── BroadcastHashJoin [dept_id]      ← join strategy decided
+                    ├── Filter [age > 30]          ← pushed DOWN near scan
+                    │       └── Project [age, dept_id, salary]  ← only needed cols
+                    │               └── Scan employees.csv
+                    └── Broadcast
+                            └── Project [dept_id, department]
+                                    └── Scan departments.csv
+```
+
+---
+
+## 🔵 PHASE 5 — Physical Planning (How to Actually Run It)
+
+The Logical Plan describes WHAT to do. The Physical Plan describes HOW to do it.
+
+### For each logical operation, Spark generates multiple physical strategies:
+
+```
+Logical: Join
+    Physical Option A: BroadcastHashJoin   → best when one side is small
+    Physical Option B: SortMergeJoin       → best for large + large tables
+    Physical Option C: ShuffleHashJoin     → alternative hash-based join
+
+Logical: Aggregate (groupBy + avg)
+    Physical Option A: HashAggregate       → hash map in memory
+    Physical Option B: SortAggregate       → sort then aggregate (fallback)
+
+Logical: Sort
+    Physical Option A: TakeOrderedAndProject → optimized for top-N
+    Physical Option B: Sort                  → full sort
+```
+
+### Physical Plan Selected (for our example)
+
+```
+*(3) Sort [avg_salary DESC]
+    └── Exchange (rangepartitioning) ← shuffle for sort
+            └── *(2) HashAggregate [department] → avg(salary) AS avg_salary
+                    └── Exchange (hashpartitioning dept_id) ← shuffle for groupBy
+                            └── *(1) BroadcastHashJoin [dept_id]
+                                    ├── Filter [age > 30]
+                                    │   └── FileScan employees.csv [age, dept_id, salary]
+                                    └── BroadcastExchange
+                                            └── FileScan departments.csv [dept_id, department]
+
+*(N) = code-gen stage (Tungsten whole-stage code generation)
+Exchange = shuffle boundary between stages
+```
+
+---
+
+## 🔵 PHASE 6 — Tungsten Code Generation
+
+Tungsten is Spark's execution engine that **generates optimized JVM bytecode** at runtime.
+
+### What Tungsten Does
+
+```
+Without Tungsten (row-at-a-time):
+    For each row:
+        deserialize row
+        call filter function
+        serialize result
+        → massive overhead per row
+
+With Tungsten (whole-stage codegen):
+    Spark generates a SINGLE tight Java loop:
+
+    for (row in partition) {
+        if (row.age > 30) {
+            hashMap.merge(row.dept_id, row.salary, ...)
+        }
+    }
+
+    → Compiled to JVM bytecode
+    → CPU cache-friendly
+    → No virtual function calls
+    → No row serialization within a stage
+```
+
+### Memory Layout Optimization
+
+```
+Java Object (WITHOUT Tungsten):
+    Object header: 16 bytes overhead
+    "Alice": String object → 40 bytes for 5 chars!
+    age: Integer object → 16 bytes for one int!
+    Total per row: ~150 bytes
+
+Tungsten UnsafeRow (binary format):
+    Fixed-length fields: direct binary
+    "Alice": 5 bytes
+    age: 4 bytes
+    Total per row: ~20 bytes
+
+→ 7x less memory
+→ CPU operates on raw bytes — no GC pressure
+```
+
+---
+
+## 🔵 PHASE 7 — WHERE DataFrame Becomes RDD
+
+This is the answer to "when does it get converted to RDD?"
+
+```
+After Physical Planning + Tungsten codegen:
+
+Spark calls: queryExecution.toRdd
+
+This converts the Physical Plan into an RDD[InternalRow]
+
+Physical Plan Node   →  RDD Operation
+────────────────────────────────────────────────────────
+FileScan             →  HadoopRDD / ParquetRDD (reads partitions)
+Filter               →  MapPartitionsRDD (applies filter per partition)
+BroadcastHashJoin    →  MapPartitionsRDD (join happens locally per partition)
+Exchange (shuffle)   →  ShuffledRowRDD (data moves across network)
+HashAggregate        →  MapPartitionsRDD (aggregate per partition)
+Sort                 →  MapPartitionsRDD (sort within partition)
+Final Exchange       →  ShuffledRowRDD (final sort shuffle)
+```
+
+### The RDD Lineage for Our Example
+
+```
+ParquetRDD / HadoopRDD (read employees.csv partitions)
+    └── MapPartitionsRDD (apply filter: age > 30, project columns)
+            └── MapPartitionsRDD (BroadcastHashJoin with departments)
+                    └── ShuffledRowRDD (Exchange: shuffle by dept_id for groupBy)
+                            └── MapPartitionsRDD (HashAggregate partial)
+                                    └── ShuffledRowRDD (Exchange: shuffle for sort)
+                                            └── MapPartitionsRDD (final sort)
+```
+
+> ⚠️ **Key insight:** The RDD is `RDD[InternalRow]` — NOT `RDD[Row]`.
+> `InternalRow` is Tungsten's binary format. It is NOT a Python Row object.
+> You never directly see this RDD unless you call `df.queryExecution.toRdd`
+
+---
+
+## 🔵 PHASE 8 — Job, Stage, and Task Execution
+
+### From RDD Lineage to Jobs, Stages, Tasks
+
+```
+Spark DAGScheduler looks at the RDD lineage
+    → Finds all "shuffle boundaries" (ShuffledRowRDD)
+    → Each boundary = a new Stage
+
+Our example produces 3 Stages:
+```
+
+### Stage 0 — Read + Filter + BroadcastHashJoin
+
+```
+Tasks: one per partition of employees.csv
+       If employees.csv = 512MB, maxPartitionBytes = 128MB → 4 tasks
+
+Each Task (runs on an Executor):
+    1. Read its 128MB chunk of employees.csv from HDFS/S3
+    2. Apply filter: age > 30
+    3. Project: keep only age, dept_id, salary
+    4. Receive broadcast copy of departments.csv (already sent to all executors)
+    5. Perform hash join locally (look up dept_id in departments hash table)
+    6. Compute PARTIAL HashAggregate (partial sum + count per department)
+    7. Write shuffle files for Stage 1 (shuffle write)
+
+Shuffle files written: 4 tasks × 200 shuffle partitions = 800 files
+```
+
+### Stage 1 — Full Aggregation (after shuffle)
+
+```
+Tasks: 200 (spark.sql.shuffle.partitions default)
+
+Each Task:
+    1. Read shuffle files from Stage 0 (shuffle read)
+       → Fetches all partial aggregates for its assigned departments
+    2. Merge partial aggregates → compute final avg(salary) per department
+    3. Write shuffle files for Stage 2 (sort shuffle)
+
+Shuffle files written: 200 × 200 = 40,000 (reduced by sort merge)
+```
+
+### Stage 2 — Final Sort
+
+```
+Tasks: 200 (same shuffle partition count)
+
+Each Task:
+    1. Read shuffle files from Stage 1
+    2. Sort rows by avg_salary DESC within partition
+    3. Write final output partition to parquet file
+
+Output: 200 parquet part files written to output/
+```
+
+### Full Execution Timeline
+
+```
+Driver                                    Cluster Manager              Workers
+──────                                    ───────────────              ───────
+result.write.parquet("output/")
+    ↓
+Build Logical Plan
+    ↓
+Optimize Plan (Catalyst)
+    ↓
+Build Physical Plan
+    ↓
+Convert to RDD DAG
+    ↓
+Submit Job to DAGScheduler
+    ↓
+DAGScheduler creates Stage 0 ──────────→ Assign tasks ──────────→ Execute 4 tasks
+                                                                    (read, filter, join)
+                                                                    Write shuffle files
+                                                                         ↓
+DAGScheduler creates Stage 1 ──────────→ Assign tasks ──────────→ Execute 200 tasks
+                                                                    (read shuffle, agg)
+                                                                    Write shuffle files
+                                                                         ↓
+DAGScheduler creates Stage 2 ──────────→ Assign tasks ──────────→ Execute 200 tasks
+                                                                    (read shuffle, sort)
+                                                                    Write parquet output
+                                                                         ↓
+Job Complete ←───────────────────────────────────────────────────────────
+```
+
+---
+
+## 🔴 PHASE 9 — Failure Handling & Recovery
+
+This is one of the most important parts — how does Spark survive failures?
+
+### Type 1: Task Failure (Most Common)
+
+```
+Scenario: One task in Stage 1 crashes (executor OOM, network blip, etc.)
+
+What happens:
+    Step 1: Executor sends failure signal to Driver
+    Step 2: TaskScheduler marks that specific task as FAILED
+    Step 3: TaskScheduler retries the task (default: 4 retries)
+            → Same task, possibly on a DIFFERENT executor
+    Step 4: If retry succeeds → job continues, no impact to other tasks
+    Step 5: If all 4 retries fail → Stage fails → Job fails → Error to user
+
+Retry config:
+    spark.task.maxFailures = 4  (default)
+```
+
+### Type 2: Executor Failure (Worker Crashes)
+
+```
+Scenario: Entire executor (worker JVM) crashes mid-job
+
+What happens:
+    Step 1: Driver detects heartbeat timeout from executor
+    Step 2: Driver asks Cluster Manager to launch a NEW executor
+    Step 3: All tasks that were running on failed executor = FAILED
+    Step 4: TaskScheduler re-queues those tasks on the new executor
+    Step 5: BUT — shuffle files written by the failed executor are LOST
+    
+If shuffle files are lost:
+    Step 6: Spark needs to RE-RUN the PARENT STAGE that produced those shuffle files
+            (This is why lineage is so critical)
+    Step 7: Only the affected partitions of the parent stage are re-run
+    Step 8: Shuffle files recomputed
+    Step 9: Failed tasks of the current stage now re-run successfully
+
+Example:
+    Stage 0 ran successfully, wrote shuffle files on Executor 3
+    Executor 3 crashes during Stage 1
+    Stage 1 tasks that needed Executor 3's shuffle files fail
+    → Spark re-runs affected Stage 0 partitions on new executor
+    → Rewrites shuffle files
+    → Stage 1 tasks retry and succeed
+```
+
+### Type 3: Shuffle Data Loss (Without Executor Failure)
+
+```
+Scenario: Shuffle files on disk get corrupted or deleted between stages
+
+What happens:
+    → FetchFailedException thrown during shuffle read
+    → Stage is re-submitted from the parent stage
+    → Entire parent stage may need to re-run
+
+This is why caching/checkpointing is important for iterative algorithms
+```
+
+### Type 4: Driver Failure (Full Job Loss)
+
+```
+Scenario: Driver process crashes
+
+What happens:
+    → ENTIRE JOB is lost (no partial recovery by default)
+    → All executors are killed by Cluster Manager
+    → Job must be restarted from scratch
+
+Mitigation:
+    → Use checkpointing for long-running jobs
+    → In YARN: driver recovery is possible with --supervise flag
+    → In Structured Streaming: checkpointing provides exactly-once guarantees
+```
+
+### Type 5: Data Skew Causing Task Failure
+
+```
+Scenario: One partition has 100x more data than others
+          → That one task runs out of memory
+
+What happens:
+    → spark.sql.adaptive.enabled = true (AQE — Adaptive Query Execution)
+    → Spark detects skewed partition at runtime
+    → Automatically SPLITS the large partition into smaller sub-tasks
+    → Re-runs only the skewed partition with splitting
+
+Without AQE:
+    → Task fails with OOM
+    → 4 retries all fail → Job fails
+    → You need to manually add salting or repartitioning
+```
+
+---
+
+## 🔵 PHASE 10 — Adaptive Query Execution (AQE) — Runtime Re-optimization
+
+AQE (enabled by default in Spark 3.0+) allows Spark to **change the physical plan at runtime** based on actual data statistics collected during execution.
+
+### AQE Feature 1: Dynamic Coalescing of Shuffle Partitions
+
+```
+BEFORE execution (at planning time):
+    spark.sql.shuffle.partitions = 200
+    → Stage 1 planned with 200 tasks
+
+AFTER Stage 0 completes (AQE kicks in):
+    AQE looks at actual shuffle data sizes:
+    Total shuffle data = 50MB (very small)
+    200 tasks × 50MB/200 = 0.25MB per task → too many tiny tasks!
+
+AQE action:
+    Coalesces 200 → 5 partitions
+    Stage 1 now runs with only 5 tasks instead of 200
+
+Result: Less overhead, faster execution
+```
+
+### AQE Feature 2: Dynamic Join Strategy Switching
+
+```
+BEFORE execution:
+    Planner chose SortMergeJoin (departments.csv looked large based on file size)
+
+AFTER Stage 0 completes (actual data stats known):
+    After filter age > 30, departments side = only 2MB
+    AQE switches join strategy: SortMergeJoin → BroadcastHashJoin
+
+Result: Eliminates shuffle for the join entirely
+```
+
+### AQE Feature 3: Skew Join Optimization
+
+```
+BEFORE: One partition in Stage 0 has 10GB of data (skewed key)
+AQE:    Detects skew, automatically splits into sub-partitions
+        Runs the skewed partition as multiple smaller tasks in parallel
+Result: No single task OOM, faster overall completion
+```
+
+---
+
+## 🔄 Complete End-to-End Flow — Visual Summary
+
+```
+Your Code
+─────────────────────────────────────────────────────────────────────
+df1 = spark.read.csv(...)
+df2 = spark.read.csv(...)
+result = df1.join(df2).filter(...).groupBy(...).agg(...).orderBy(...)
+result.write.parquet(...)   ← ACTION triggers everything below
+         │
+         ▼
+─────────────────────────────────────────────────────────────────────
+DRIVER — PLANNING PHASE (no data movement)
+─────────────────────────────────────────────────────────────────────
+         │
+         ▼
+[1] Unresolved Logical Plan
+    (tree of nodes: Scan, Join, Filter, Aggregate, Sort)
+         │
+         ▼
+[2] Catalyst Analyzer
+    → Resolve column names via Catalog
+    → Assign unique IDs to columns
+    → Type checking and coercion
+         │
+         ▼
+[3] Resolved Logical Plan
+         │
+         ▼
+[4] Catalyst Optimizer
+    → Predicate Pushdown
+    → Column Pruning
+    → Join Reordering
+    → Broadcast Detection
+    → Constant Folding
+    → 50+ other rules
+         │
+         ▼
+[5] Optimized Logical Plan
+         │
+         ▼
+[6] Physical Planner
+    → Enumerate physical strategies
+    → Cost-based optimizer picks best plan
+    → BroadcastHashJoin vs SortMergeJoin
+    → HashAggregate vs SortAggregate
+         │
+         ▼
+[7] Physical Plan
+         │
+         ▼
+[8] Tungsten Code Generation
+    → Generate JVM bytecode per stage
+    → Whole-stage codegen (fuse operators)
+    → Binary UnsafeRow memory format
+         │
+         ▼
+[9] Convert to RDD DAG
+    Physical Plan nodes → RDD[InternalRow] chain
+    (HERE is where DataFrame becomes RDD)
+         │
+         ▼
+[10] DAGScheduler
+    → Find shuffle boundaries
+    → Split RDD DAG into Stages
+    → Our example: Stage 0, Stage 1, Stage 2
+         │
+         ▼
+─────────────────────────────────────────────────────────────────────
+CLUSTER — EXECUTION PHASE (actual data movement)
+─────────────────────────────────────────────────────────────────────
+         │
+         ▼
+[11] Stage 0 submitted
+    → TaskScheduler assigns tasks to executors
+    → Each task: read partition → filter → join → partial agg
+    → Tasks write shuffle files to local disk
+    → AQE collects stats on shuffle output
+         │
+         ▼
+[12] AQE re-optimization (between stages)
+    → Coalesce partitions if data is small
+    → Switch join strategies if needed
+    → Handle skew if detected
+         │
+         ▼
+[13] Stage 1 submitted
+    → Tasks shuffle-read from Stage 0
+    → Final aggregation per partition
+    → Write shuffle files for Stage 2
+         │
+         ▼
+[14] Stage 2 submitted
+    → Tasks shuffle-read from Stage 1
+    → Sort within each partition
+    → Write parquet output files
+         │
+         ▼
+─────────────────────────────────────────────────────────────────────
+FAILURE HANDLING (at any stage)
+─────────────────────────────────────────────────────────────────────
+
+Task fails         → Retry on same/different executor (max 4 retries)
+Executor fails     → Re-launch executor + re-run affected tasks
+                   → Re-run parent stage if shuffle files lost
+Shuffle data lost  → FetchFailedException → re-run parent stage
+Driver fails       → Full job restart required
+Data skew          → AQE splits skewed partition into sub-tasks
+
+─────────────────────────────────────────────────────────────────────
+OUTPUT
+─────────────────────────────────────────────────────────────────────
+200 parquet part files written to output/ ✅
+Job complete signal sent to driver ✅
+```
+
+---
+
+## 🔬 Deep Dive: The Join — What Happens Physically
+
+Joins are the most complex operation. Here's exactly what happens for each join type:
+
+### BroadcastHashJoin (small table + large table)
+
+```
+Trigger: departments.csv < spark.sql.autoBroadcastJoinThreshold (default 10MB)
+
+Step 1: Driver collects departments.csv entirely (or executor collects it)
+Step 2: Serialize departments into a compact hash map
+Step 3: Broadcast the hash map to ALL executors (network broadcast)
+Step 4: Each executor receives a full copy of departments hash map
+Step 5: Each task (processing employees partition) does:
+            for each employee row:
+                key = employee.dept_id
+                dept_row = hashMap.lookup(key)  ← local lookup, no network
+                emit joined row
+
+NO SHUFFLE — entire join is local per executor
+```
+
+### SortMergeJoin (large table + large table)
+
+```
+Trigger: Both tables too large for broadcast
+
+Step 1: SHUFFLE PHASE — both sides shuffled by join key
+            employees: hash(dept_id) % numPartitions → shuffle
+            departments: hash(dept_id) % numPartitions → shuffle
+            → All rows with same dept_id land in SAME partition on SAME executor
+
+Step 2: SORT PHASE — within each partition, sort both sides by join key
+            employees partition 5: sorted by dept_id
+            departments partition 5: sorted by dept_id
+
+Step 3: MERGE PHASE — two-pointer merge (like merge sort)
+            pointer_left = 0, pointer_right = 0
+            while both pointers valid:
+                if left.dept_id == right.dept_id:
+                    emit joined row
+                    advance pointers
+                elif left.dept_id < right.dept_id:
+                    advance left pointer
+                else:
+                    advance right pointer
+
+REQUIRES 2 shuffles (one per table side)
+```
+
+### ShuffleHashJoin (medium + medium tables)
+
+```
+Step 1: Shuffle smaller side by join key (hash partitioning)
+Step 2: Build hash map from smaller side partitions
+Step 3: Shuffle larger side by join key
+Step 4: Probe hash map with larger side rows
+
+REQUIRES 2 shuffles, but no sort step
+Risky: if hash map doesn't fit in memory → OOM
+```
+
+---
+
+## 🔬 Deep Dive: GroupBy + Aggregate — What Happens Physically
+
+```python
+df.groupBy("department").agg(avg("salary"))
+```
+
+### Two-Phase Aggregation (Partial + Final)
+
+```
+PHASE 1 — Partial Aggregation (map-side, BEFORE shuffle)
+──────────────────────────────────────────────────────
+Each task processes its partition BEFORE any data moves:
+
+Partition 0 has rows:
+    (Alice, Engineering, 90000)
+    (Bob,   Engineering, 80000)
+    (Carol, Marketing,   70000)
+
+Partial aggregate computed LOCALLY:
+    Engineering → sum=170000, count=2
+    Marketing   → sum=70000,  count=1
+
+This runs INSIDE the same stage as the filter/join
+→ Data volume dramatically reduced before shuffle
+
+──────────────────────────────────────────────────────
+SHUFFLE — Route partial aggregates by department
+──────────────────────────────────────────────────────
+hash("Engineering") % 200 = partition 47
+hash("Marketing")   % 200 = partition 123
+
+All "Engineering" partial aggregates → executor handling partition 47
+All "Marketing" partial aggregates   → executor handling partition 123
+
+──────────────────────────────────────────────────────
+PHASE 2 — Final Aggregation (reduce-side, AFTER shuffle)
+──────────────────────────────────────────────────────
+Partition 47 receives all Engineering partial aggregates:
+    From task 0: sum=170000, count=2
+    From task 1: sum=150000, count=2
+    From task 2: sum=200000, count=3
+    From task 3: sum=120000, count=2
+
+Final merge:
+    Engineering → sum=640000, count=9 → avg = 71111.11
+
+No more shuffling needed — result is final
+```
+
+---
+
+## 💾 Caching & Persistence — Avoiding Recomputation
+
+```python
+df_filtered = df1.join(df2, "dept_id").filter(col("age") > 30)
+df_filtered.cache()  # or df_filtered.persist(StorageLevel.MEMORY_AND_DISK)
+
+# Now use df_filtered multiple times
+count1 = df_filtered.count()                          # triggers execution + caching
+count2 = df_filtered.groupBy("dept").count().show()   # reads from cache, not disk
+count3 = df_filtered.filter(col("salary") > 50000).count()  # reads from cache
+```
+
+### What cache() Does Under the Hood
+
+```
+First action (df_filtered.count()):
+    → Full pipeline executes (read → join → filter)
+    → Results stored as RDD[InternalRow] partitions in executor memory
+    → Metadata registered in BlockManager on each executor
+    → Driver's BlockManagerMaster knows which partitions are cached where
+
+Subsequent actions:
+    → Spark sees df_filtered is cached
+    → Skips read → join → filter steps entirely
+    → Reads directly from cached RDD[InternalRow] in executor memory
+    → MUCH faster
+
+If executor memory is full:
+    → LRU eviction: oldest cached partitions removed
+    → cache()        = MEMORY_ONLY → evicted partitions recomputed on demand
+    → persist(MEMORY_AND_DISK) → evicted partitions spill to disk
+```
+
+### Storage Levels
+
+```
+StorageLevel.MEMORY_ONLY         → Store as deserialized Java objects in JVM heap
+                                   Fastest but most memory-hungry
+StorageLevel.MEMORY_AND_DISK     → Spill to disk if memory full
+StorageLevel.MEMORY_ONLY_SER     → Store as serialized bytes (less memory, slower)
+StorageLevel.DISK_ONLY           → Store only on disk
+StorageLevel.OFF_HEAP             → Store in Tungsten off-heap memory (no GC)
+```
+
+---
+
+## 🔑 Checkpointing — Breaking Long Lineage Chains
+
+For iterative algorithms (ML, graph processing), the RDD lineage can get very long:
+
+```
+Iteration 1: RDD1 → RDD2 → RDD3 → RDD4 → RDD5
+Iteration 2: RDD5 → RDD6 → RDD7 → RDD8 → RDD9
+...
+Iteration 100: RDD495 → ... → RDD500
+
+If RDD300 fails → Spark must recompute from RDD1!
+Lineage traversal itself becomes expensive
+```
+
+### Checkpointing Cuts the Lineage
+
+```python
+spark.sparkContext.setCheckpointDir("hdfs://checkpoints/")
+
+df_iter = initial_df
+for i in range(100):
+    df_iter = one_iteration(df_iter)
+    if i % 10 == 0:
+        df_iter = df_iter.checkpoint()  # ← materializes to HDFS, cuts lineage
+
+# Now if failure at iteration 55:
+# → Recompute only from checkpoint at iteration 50 (not from start)
+```
+
+---
+
+## ⚠️ Key Things People Get Wrong
+
+### ❌ Misconception 1: "DataFrame IS an RDD"
+```
+Wrong: DataFrame is just a fancy wrapper around RDD
+Right: DataFrame is a HIGHER-LEVEL ABSTRACTION with its own planning and
+       optimization pipeline. It only becomes an RDD[InternalRow] at the
+       FINAL execution step, after all optimization.
+```
+
+### ❌ Misconception 2: "Each transformation executes immediately"
+```
+Wrong: df.filter(...).groupBy(...) runs step by step
+Right: These are ALL lazy. Nothing runs until an action is called.
+       Spark collects ALL transformations into one plan and optimizes
+       the ENTIRE plan before executing anything.
+```
+
+### ❌ Misconception 3: "More partitions = faster"
+```
+Wrong: Always use 1000 partitions for parallelism
+Right: Too many small partitions → task scheduling overhead > actual work
+       Too few large partitions → some executors idle
+       Rule of thumb: 2-4 partitions per CPU core in your cluster
+       AQE can auto-tune this at runtime
+```
+
+### ❌ Misconception 4: "Shuffle is always bad"
+```
+Wrong: Avoid all shuffles at all costs
+Right: Some shuffles are unavoidable (groupBy, join on different keys, sort)
+       AQE can reduce shuffle cost significantly
+       Proper partitioning upfront can eliminate unnecessary shuffles
+```
+
+---
+
+## 🎯 Complete Summary Table
+
+| Phase | What Happens | Data Movement? | Where? |
+|---|---|---|---|
+| Read | File metadata + schema inference | No (metadata only) | Driver |
+| Logical Plan | Build plan tree per transformation | No | Driver |
+| Analysis | Resolve columns, types, functions | No | Driver |
+| Optimization | Catalyst rewrites plan (50+ rules) | No | Driver |
+| Physical Plan | Choose join/agg strategies | No | Driver |
+| Codegen | Generate JVM bytecode per stage | No | Driver |
+| RDD Conversion | Physical plan → RDD[InternalRow] | No | Driver |
+| Stage Split | DAGScheduler finds shuffle boundaries | No | Driver |
+| Stage 0 Execution | Read → Filter → Join → Partial Agg | Local reads | Executors |
+| Shuffle Write | Write shuffle files to local disk | Local disk | Executors |
+| AQE Re-optimize | Coalesce/replan based on real stats | No | Driver |
+| Stage 1 Execution | Shuffle Read → Final Agg | Network transfer | Executors |
+| Stage 2 Execution | Sort → Write output | Network + disk write | Executors |
+| Task Failure | Retry task (up to 4x) | Minimal | Executors |
+| Executor Failure | Re-run lost tasks + parent stage | Re-reads source | Executors |
 
 # Spark configuration 
 - spark.master 
@@ -712,7 +3583,10 @@ Now lets understand what happens step by step when a job is submitted -
    - If 1 or 2 keys have way more records — that’s data skew. You’ll need salting or skew hints (see below).
 
 
+## What is Skewness and how to avoid Skewness using `by chaninging the joining stretegy`, `salting` and `Enabling AQE`
 
+
+## What is AQE and provide an example that explains the usages of AQE and disadvantages of it
 
 
 # Notebook tests
@@ -1387,3 +4261,761 @@ Tasks	8 (parallel)	1 (sequential)
 Network Transfer	8 streams (~1M rows each)	1 giant stream (8M rows)
 Speed	Minutes	Hours (or fails)
 ```
+
+
+# Shuffle partitions / `spark.sql.shuffle.partitions` — Complete Clear Explanation
+
+---
+
+## 📌 What Is It — One Clear Definition
+
+```
+spark.sql.shuffle.partitions = N
+```
+
+**This single number answers one question:**
+
+> *"After a shuffle (join, groupBy, orderBy), into how many pieces should the data be split?"*
+
+- **Default value = 200**
+- It controls the number of **output partitions AFTER a shuffle operation**
+- It does NOT affect how files are read (that's `maxPartitionBytes`)
+- It does NOT affect non-shuffle operations like `filter`, `select`, `withColumn`
+
+---
+
+## 🔑 The Golden Rule — What Triggers This Parameter?
+
+This parameter ONLY fires for **wide transformations** (operations that require a shuffle):
+
+```
+Operations that USE spark.sql.shuffle.partitions:
+✅ JOIN          (SortMergeJoin, ShuffleHashJoin)
+✅ groupBy()
+✅ orderBy() / sort()
+✅ distinct()
+✅ repartition(N)  ← only if you don't specify N explicitly
+✅ window functions
+
+Operations that DO NOT use spark.sql.shuffle.partitions:
+❌ filter()
+❌ select()
+❌ withColumn()
+❌ map() / flatMap()
+❌ BroadcastHashJoin  ← no shuffle at all
+❌ spark.read.csv()   ← controlled by maxPartitionBytes
+```
+
+---
+
+## 🖥️ Our Cluster Setup
+
+```
+Cluster:
+├── 3 Executors
+│     ├── Memory per executor = 4 GB
+│     └── Cores per executor  = 4
+│
+├── Total cores  = 3 × 4 = 12 cores
+├── Total memory = 3 × 4 = 12 GB
+│
+└── spark.sql.shuffle.partitions = 200 (default)
+```
+
+### What does 12 cores mean for parallelism?
+
+```
+12 cores = 12 tasks can run SIMULTANEOUSLY
+
+One task = one partition being processed at one time
+
+So at any point in time:
+    - Up to 12 partitions are being processed in parallel
+    - Remaining partitions wait in a queue
+```
+
+---
+
+## 📦 Our Data Setup
+
+```
+Table A: orders       = 100 GB
+Table B: customers    = 100 GB
+Total data            = 200 GB
+
+Query:
+SELECT o.order_id, c.name, o.amount
+FROM orders o
+JOIN customers c ON o.customer_id = c.customer_id
+WHERE o.amount > 500
+```
+
+---
+
+## 🔵 STEP 1 — Reading the Files (Before shuffle.partitions matters)
+
+```
+Reading is controlled by spark.sql.files.maxPartitionBytes = 128 MB (default)
+
+Table A: orders (100 GB)
+    100 GB / 128 MB = ~800 partitions created at read time
+
+Table B: customers (100 GB)
+    100 GB / 128 MB = ~800 partitions created at read time
+
+State right now:
+    orders_rdd    → 800 partitions spread across 3 executors
+    customers_rdd → 800 partitions spread across 3 executors
+```
+
+### How 800 partitions distribute across 3 executors?
+
+```
+Executor 1: partitions 1–267   (~33 GB of orders data)
+Executor 2: partitions 268–534 (~33 GB of orders data)
+Executor 3: partitions 535–800 (~34 GB of orders data)
+
+Same distribution for customers table
+```
+
+### Parallelism during read (12 cores, 800 partitions):
+
+```
+Wave 1:  12 tasks run simultaneously → process 12 partitions
+Wave 2:  12 tasks run simultaneously → process next 12 partitions
+...
+Wave 67: 12 tasks run → process partitions 793–800 (only 8 tasks active)
+Total waves = ceil(800/12) ≈ 67 waves to read one table
+```
+
+---
+
+## 🔵 STEP 2 — Filter Pushdown (Before Shuffle)
+
+Catalyst Optimizer pushes `WHERE o.amount > 500` down to the scan:
+
+```
+BEFORE optimization:
+    Read all 800 partitions of orders → then filter
+
+AFTER optimization (predicate pushdown):
+    Filter amount > 500 WHILE reading → fewer rows enter the join
+
+Assume 60% of orders have amount > 500:
+    800 partitions × 128 MB × 60% = ~61 GB of data after filter
+    Still 800 partitions but each partition is now smaller (~76 MB average)
+```
+
+---
+
+## 🔵 STEP 3 — THE SHUFFLE (Where spark.sql.shuffle.partitions = 200 kicks in)
+
+This is the core of the explanation. A SortMergeJoin requires both sides to be
+**hash-partitioned by the join key** (`customer_id`).
+
+### Why shuffle is needed:
+
+```
+Current state (after read):
+    Partition 1 of orders    → has customer_id: 101, 450, 8823, 234, ...  (random mix)
+    Partition 2 of orders    → has customer_id: 55, 8823, 101, 9001, ...  (random mix)
+
+The SAME customer_id (e.g., 8823) appears in MULTIPLE partitions
+    → You cannot join locally
+    → All rows with customer_id = 8823 MUST land on the SAME executor
+
+Solution: Shuffle — redistribute data by join key
+```
+
+### How the shuffle works with shuffle.partitions = 200:
+
+```
+Spark assigns each customer_id to a "bucket" using:
+    target_partition = hash(customer_id) % 200
+
+Example:
+    customer_id = 8823  → hash(8823) % 200 = 47  → goes to shuffle partition 47
+    customer_id = 101   → hash(101)  % 200 = 101 → goes to shuffle partition 101
+    customer_id = 234   → hash(234)  % 200 = 34  → goes to shuffle partition 34
+
+This applies to BOTH tables:
+    orders row    with customer_id=8823 → partition 47
+    customers row with customer_id=8823 → partition 47
+
+Guarantee: ALL rows with the same customer_id land in the SAME partition number
+           on the SAME executor — ready to be joined locally
+```
+
+### Shuffle Write Phase (Stage 0 — all 800 read tasks do this):
+
+```
+Each of the 800 read tasks:
+    Reads its 128 MB chunk
+    Applies filter (amount > 500)
+    For EACH row, computes: hash(customer_id) % 200
+    Sorts rows by target partition number
+    Writes 200 small "shuffle files" to LOCAL disk
+
+Shuffle files created:
+    800 tasks × 200 buckets = 160,000 shuffle files per table
+    2 tables = 320,000 shuffle files total on local disks
+
+Each shuffle file is tiny:
+    orders: 61 GB / 160,000 files ≈ 0.38 MB per shuffle file
+```
+
+---
+
+## 🔵 STEP 4 — Shuffle Read (Stage 1 begins — 200 tasks start)
+
+```
+spark.sql.shuffle.partitions = 200 means 200 tasks in Stage 1
+
+Each task is responsible for ONE shuffle partition (bucket number):
+    Task 47  → fetches ALL shuffle files labeled "bucket 47" from ALL 800 read tasks
+    Task 101 → fetches ALL shuffle files labeled "bucket 101" from ALL 800 read tasks
+    ...
+
+Task 47 fetches from orders side:
+    800 write tasks × (61 GB / 200 buckets) ÷ 800 = ~305 MB of orders data
+    (all rows where hash(customer_id) % 200 = 47)
+
+Task 47 fetches from customers side:
+    ~500 MB of customers data (no filter applied to customers)
+    (100 GB / 200 buckets = 500 MB per bucket per side)
+
+Task 47 now has:
+    All order rows   with customer_id mapping to bucket 47: ~305 MB
+    All customer rows with customer_id mapping to bucket 47: ~500 MB
+    → Performs local SortMergeJoin → only rows with matching customer_id are joined
+```
+
+---
+
+## 🔵 STEP 5 — The 200 Tasks Running on 12 Cores
+
+```
+200 shuffle partitions ÷ 12 cores = ~17 waves of execution
+
+Wave 1:  Tasks 1–12   run simultaneously on 12 cores
+Wave 2:  Tasks 13–24  run simultaneously on 12 cores
+Wave 3:  Tasks 25–36  run simultaneously on 12 cores
+...
+Wave 17: Tasks 193–200 run (only 8 tasks, 4 cores idle)
+
+Each task processes:
+    orders side:    ~305 MB
+    customers side: ~500 MB
+    Total per task: ~805 MB
+
+Memory check per task:
+    Each executor has 4 GB, running 4 tasks simultaneously
+    Available memory per task = 4 GB / 4 tasks ≈ 1 GB per task
+
+    SortMergeJoin needs to sort both sides:
+    ~805 MB of data, ~1 GB available → tight but workable
+    If it doesn't fit → Spark spills to disk (slower but no failure)
+```
+
+---
+
+## 🔵 STEP 6 — What Happens After the Join
+
+```
+After 200 tasks complete the join:
+    Result has 200 partitions
+    Each partition has joined rows where amount > 500
+
+If you do nothing:
+    result.write.parquet("output/") → writes 200 parquet files
+
+If you then do groupBy or orderBy:
+    Another shuffle fires → uses spark.sql.shuffle.partitions = 200 again
+    200 tasks process the 200 join-result partitions → still 200 output partitions
+```
+
+---
+
+## ❌ PROBLEM: What if shuffle.partitions = 200 is Wrong for Our Cluster?
+
+### Scenario A: shuffle.partitions = 200 (default) — Is it right?
+
+```
+Total shuffle data (both sides combined per partition):
+    orders per partition:    61 GB / 200  = ~305 MB
+    customers per partition: 100 GB / 200 = ~500 MB
+    Total per task:          ~805 MB
+
+Memory available per task:
+    Executor memory = 4 GB
+    Spark reserves ~40% for overhead/storage → usable = ~2.4 GB for execution
+    4 cores per executor → memory per task = 2.4 GB / 4 = ~600 MB
+
+805 MB needed vs 600 MB available → SPILL TO DISK likely
+Still works, just slower. 200 is borderline for this cluster.
+```
+
+### Scenario B: shuffle.partitions = 50 (too few)
+
+```
+Data per partition:
+    orders:    61 GB / 50  = ~1.2 GB per partition
+    customers: 100 GB / 50 = ~2.0 GB per partition
+    Total:     ~3.2 GB per task
+
+Memory available per task: ~600 MB
+3.2 GB needed vs 600 MB available → MASSIVE SPILL or OOM crash
+
+Also:
+    50 partitions ÷ 12 cores = ~5 waves only
+    Cluster is underutilized — many cores idle at wave 5 (only 2 tasks left)
+```
+
+### Scenario C: shuffle.partitions = 2000 (too many)
+
+```
+Data per partition:
+    orders:    61 GB / 2000  = ~30 MB per partition
+    customers: 100 GB / 2000 = ~50 MB per partition
+    Total:     ~80 MB per task
+
+Memory available per task: ~600 MB
+80 MB needed → fits EASILY in memory ✅
+
+BUT:
+    2000 partitions ÷ 12 cores = ~167 waves
+    Task scheduling overhead for tiny 80 MB tasks → inefficient
+    Too many tiny output files (2000 parquet files) → small file problem
+
+The overhead of managing 2000 tasks > benefit of smaller task size
+```
+
+### Scenario D: shuffle.partitions = 400 (sweet spot for our cluster) ✅
+
+```
+Data per partition:
+    orders:    61 GB / 400  = ~152 MB
+    customers: 100 GB / 400 = ~250 MB
+    Total:     ~402 MB per task
+
+Memory available per task: ~600 MB
+402 MB < 600 MB → fits in memory, NO SPILL ✅
+
+Waves:
+    400 partitions ÷ 12 cores = ~34 waves
+    Good parallelism, reasonable wave count ✅
+
+Output:
+    400 parquet files → manageable ✅
+
+This is the sweet spot for our 3-executor × 4-core × 4GB cluster
+```
+
+---
+
+## 🧮 The Formula — How to Calculate the Right Value
+
+```
+Step 1: Estimate total shuffle data size
+    = largest_table × 2 (both sides of join need to fit)
+    = 100 GB customers (larger, no filter) + 61 GB orders (after filter)
+    = 161 GB total shuffle data
+
+Step 2: Determine target partition size
+    Sweet spot: 100 MB – 200 MB per partition
+    (fits in memory without spilling, not too tiny for overhead)
+    Use: 150 MB as target
+
+Step 3: Calculate partitions
+    shuffle.partitions = total_shuffle_data / target_partition_size
+                       = 161,000 MB / 150 MB
+                       = ~1073
+
+    But each partition processes data from BOTH tables separately:
+    orders per partition:    61,000 MB / N
+    customers per partition: 100,000 MB / N
+    Memory needed per task:  161,000 MB / N
+
+    For memory to fit:
+    161,000 MB / N < available_memory_per_task (600 MB)
+    N > 161,000 / 600
+    N > ~268
+
+    Round up to nearest power of 2 or clean number: N = 300 or 400
+
+Step 4: Verify parallelism
+    N / total_cores = 400 / 12 = 33 waves → good ✅
+
+Step 5: Final answer
+    spark.sql.shuffle.partitions = 400 for this specific job
+```
+
+---
+
+## ⚡ AQE — Adaptive Query Execution (Spark 3.0+)
+
+With AQE enabled (`spark.sql.adaptive.enabled = true`, default in Spark 3.2+),
+Spark automatically tunes `shuffle.partitions` at runtime:
+
+```
+spark.sql.shuffle.partitions = 200  ← you set this as the MAXIMUM
+
+At runtime, after Stage 0 completes:
+    AQE measures actual shuffle data sizes:
+    "Bucket 47 only has 2 MB of data... bucket 101 has 450 MB..."
+
+AQE then:
+    Coalesces tiny partitions together → fewer, larger tasks
+    Keeps large partitions as-is
+
+Example:
+    You set shuffle.partitions = 200
+    AQE sees only 161 GB total, partitions are uneven
+    AQE coalesces 200 → 120 effective partitions (merging tiny ones)
+    Result: no tiny tasks, no wasted scheduling overhead
+
+Config:
+    spark.sql.adaptive.enabled                        = true
+    spark.sql.adaptive.coalescePartitions.enabled     = true
+    spark.sql.adaptive.advisoryPartitionSizeInBytes   = 128MB  ← target size per partition
+    spark.sql.adaptive.coalescePartitions.minPartitionNum = 1
+```
+
+### AQE skew handling:
+
+```
+Without AQE:
+    customer_id = 1 (a mega-popular customer) → 30 GB in one partition
+    → Task for that partition: needs 30 GB memory → OOM
+
+With AQE (skew join optimization):
+    spark.sql.adaptive.skewJoin.enabled = true
+    AQE detects partition is 30 GB (>> median of 300 MB)
+    Automatically SPLITS partition into sub-tasks:
+    30 GB → 100 sub-tasks of 300 MB each → runs fine
+```
+
+---
+
+## 📊 Full Visual — Our 100GB × 100GB Join End-to-End
+
+```
+CLUSTER: 3 executors × 4 cores × 4 GB
+════════════════════════════════════════════════════════════════════════
+
+STAGE 0 — READ + FILTER (800 tasks, 12 at a time)
+────────────────────────────────────────────────────────────────────────
+┌─────────────────────────────────────────────────────────────────────┐
+│  HDFS/S3                                                            │
+│  orders.parquet    [100 GB] → 800 partitions (128MB each)           │
+│  customers.parquet [100 GB] → 800 partitions (128MB each)           │
+└───────────────────────────┬─────────────────────────────────────────┘
+                            │ read 12 partitions at a time
+                            ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  Executor 1  │  │  Executor 2  │  │  Executor 3  │
+│  4 tasks     │  │  4 tasks     │  │  4 tasks     │
+│  reading     │  │  reading     │  │  reading     │
+│  + filter    │  │  + filter    │  │  + filter    │
+│  amount>500  │  │  amount>500  │  │  amount>500  │
+└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+       │                 │                 │
+       │  each task writes 200 shuffle files to local disk
+       │  (one file per shuffle partition bucket)
+       ▼                 ▼                 ▼
+  local disk         local disk         local disk
+  267×200 files      267×200 files      266×200 files
+  = 53,400 files     = 53,400 files     = 53,200 files
+
+Total shuffle files: ~160,000 (orders) + ~160,000 (customers) = 320,000 files
+
+────────────────────────────────────────────────────────────────────────
+SHUFFLE — DATA REDISTRIBUTION BY customer_id
+────────────────────────────────────────────────────────────────────────
+
+hash(customer_id) % 200 determines which executor gets each row
+
+customer_id=8823 from partition 1   (Executor 1 disk) ──┐
+customer_id=8823 from partition 45  (Executor 1 disk) ──┤
+customer_id=8823 from partition 267 (Executor 2 disk) ──┼──→ Executor 2, Task 47
+customer_id=8823 from partition 400 (Executor 2 disk) ──┤    (all 8823 rows together)
+customer_id=8823 from partition 600 (Executor 3 disk) ──┤
+customer_id=8823 from partition 799 (Executor 3 disk) ──┘
+
+────────────────────────────────────────────────────────────────────────
+STAGE 1 — SHUFFLE READ + JOIN + AGG (200 tasks, 12 at a time)
+────────────────────────────────────────────────────────────────────────
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│  Executor 1  │  │  Executor 2  │  │  Executor 3  │
+│  Tasks       │  │  Tasks       │  │  Tasks       │
+│  1,2,3,4     │  │  5,6,7,8     │  │  9,10,11,12  │
+│              │  │              │  │              │
+│ Each task:   │  │ Each task:   │  │ Each task:   │
+│ - Fetch ~305 │  │ - Fetch ~305 │  │ - Fetch ~305 │
+│   MB orders  │  │   MB orders  │  │   MB orders  │
+│ - Fetch ~500 │  │ - Fetch ~500 │  │ - Fetch ~500 │
+│   MB cust    │  │   MB cust    │  │   MB cust    │
+│ - Sort both  │  │ - Sort both  │  │ - Sort both  │
+│ - Merge join │  │ - Merge join │  │ - Merge join │
+│ - Output     │  │ - Output     │  │ - Output     │
+│   joined rows│  │   joined rows│  │   joined rows│
+└──────────────┘  └──────────────┘  └──────────────┘
+
+200 tasks ÷ 12 cores = ~17 waves of execution
+
+════════════════════════════════════════════════════════════════════════
+FINAL OUTPUT: 200 partitions of joined results
+```
+
+---
+
+## 🧠 Summary — Everything You Need to Know
+
+### What `spark.sql.shuffle.partitions` controls:
+
+```
+BEFORE shuffle:  data is in N partitions (could be 800 from file read)
+                 ↓  shuffle happens (join / groupBy / orderBy)
+AFTER shuffle:   data is in spark.sql.shuffle.partitions partitions (200 by default)
+```
+
+### The 3-way tradeoff:
+
+```
+Too LOW (e.g., 50):
+    ❌ Each partition too large → OOM / excessive spill to disk
+    ❌ Less parallelism → some cores idle
+    ❌ Skew impact is worse (one big partition = one slow task = whole stage waits)
+
+Too HIGH (e.g., 2000):
+    ❌ Too many tiny partitions → task scheduling overhead
+    ❌ Thousands of tiny output files → downstream read is slow (small file problem)
+    ❌ More shuffle files to manage = more metadata overhead
+
+Just Right (e.g., 400 for our cluster):
+    ✅ Each partition fits comfortably in memory (~400 MB)
+    ✅ Good parallelism (33 waves for 12 cores)
+    ✅ Reasonable output file count
+    ✅ Minimal spill
+```
+
+### Quick sizing formula:
+
+```
+shuffle.partitions = max(
+    total_shuffle_data_MB / target_partition_size_MB,   ← memory constraint
+    total_cores × 2                                      ← parallelism constraint
+)
+
+For our example:
+    = max(161,000 / 150,  12 × 2)
+    = max(1073, 24)
+    = 1073  ← but each task sees only ONE side at a time
+    
+    Revised (each task sees both sides summed, not divided):
+    = 161,000 / 600  (available memory per task)
+    = ~268 → round to 300 or 400
+
+With AQE enabled: set to 1000, let AQE coalesce down automatically ✅
+```
+
+### The one-line rule:
+
+```
+spark.sql.shuffle.partitions = (total shuffle data) / (memory per task)
+
+where memory per task = executor_memory × 0.6 / cores_per_executor
+```
+
+| Cluster Size | Shuffle Data | Recommended Value |
+|---|---|---|
+| Small (2 exec × 2 core × 2GB) | < 10 GB | 10–50 |
+| Medium (3 exec × 4 core × 4GB) | 50–200 GB | 200–500 |
+| Large (10 exec × 8 core × 16GB) | 500 GB–2 TB | 500–2000 |
+| With AQE (Spark 3.2+) | Any | Set high (1000+), let AQE tune |
+
+
+## # Where Are Shuffle Intermediate Files Stored? — Step by Step
+
+---
+
+## Our Setup (Quick Reminder)
+```
+3 Executors × 4 cores × 4 GB
+Join: 100 GB orders + 100 GB customers = 200 GB total
+Available memory per task = ~600 MB
+Total shuffle data = ~161 GB  ← WAY bigger than 12 GB total cluster memory
+```
+
+---
+
+## The Core Answer
+
+```
+Shuffle intermediate files go to:
+    LOCAL DISK of each executor (not memory, not HDFS, not S3)
+
+Specifically:
+    spark.local.dir = /tmp/spark-xxx/  (default)
+    (configurable — should always point to fast SSD in production)
+```
+
+---
+
+## Step-by-Step: What Happens to the 161 GB
+
+### Step 1 — Each Task Reads Its Partition Into Memory (128 MB chunk)
+
+```
+Task on Executor 1:
+    Reads 128 MB partition of orders into executor memory ✅
+    Applies filter (amount > 500) → maybe 76 MB remains in memory
+    Computes hash(customer_id) % 200 for each row → groups into 200 buckets
+```
+
+### Step 2 — Shuffle Write: Buckets Written to LOCAL DISK Immediately
+
+```
+Task does NOT hold all 200 buckets in memory at once.
+
+It writes each bucket to local disk as it fills up:
+
+Executor 1 — local disk (/tmp/spark-local/):
+    shuffle_0_0_0.data   → bucket 0   (~0.38 MB)
+    shuffle_0_0_1.data   → bucket 1   (~0.38 MB)
+    shuffle_0_0_2.data   → bucket 2   (~0.38 MB)
+    ...
+    shuffle_0_0_199.data → bucket 199 (~0.38 MB)
+
+Memory used during write: only ONE bucket in memory at a time → tiny
+Memory freed: partition buffer released after write completes
+```
+
+### Step 3 — All 800 Tasks Write Their Shuffle Files
+
+```
+800 tasks × 200 buckets = 160,000 files per table
+2 tables = 320,000 shuffle files total
+
+Stored on LOCAL DISK across 3 executors:
+    Executor 1 local disk: ~107,000 files (~54 GB)
+    Executor 2 local disk: ~107,000 files (~54 GB)
+    Executor 3 local disk: ~106,000 files (~53 GB)
+
+Total on disk: ~161 GB spread across local disks
+```
+
+### Step 4 — Shuffle Read: Fetch Over Network Into Memory
+
+```
+Stage 1 starts — 200 tasks begin
+
+Task 47 (running on Executor 2) needs bucket 47 from ALL 800 write tasks:
+
+    Executor 2 fetches from:
+        Executor 1 local disk → shuffle_*_*_47.data  (network transfer)
+        Executor 2 local disk → shuffle_*_*_47.data  (local read)
+        Executor 3 local disk → shuffle_*_*_47.data  (network transfer)
+
+    All fetched data for bucket 47:
+        orders side:    ~305 MB
+        customers side: ~500 MB
+        Total:          ~805 MB
+
+    Available memory per task: ~600 MB
+
+    805 MB > 600 MB → SPILL happens (see Step 5)
+```
+
+### Step 5 — Spill: When Memory Is Not Enough
+
+```
+Task 47 is trying to sort 805 MB with only 600 MB:
+
+    Step A: Fill memory buffer up to 600 MB
+    Step B: Sort what's in memory
+    Step C: Write sorted chunk to LOCAL DISK as a "spill file"
+            → /tmp/spark-local/spill_task47_spill1.data
+    Step D: Free memory buffer
+    Step E: Read next chunk into memory → sort → spill again
+    Step F: Repeat until all 805 MB processed
+
+    Spill files on local disk:
+        /tmp/spark-local/spill_task47_spill1.data  (~600 MB)
+        /tmp/spark-local/spill_task47_spill2.data  (~205 MB)
+
+    Step G: Final merge pass — read all spill files, merge-sort them
+            → produce final sorted output for the join
+```
+
+---
+
+## Complete Storage Flow — Visual
+
+```
+S3 / HDFS (source)
+    │
+    │  read 128 MB at a time
+    ▼
+EXECUTOR MEMORY (128 MB partition)
+    │
+    │  filter + hash by join key
+    │  write bucket files immediately
+    ▼
+EXECUTOR LOCAL DISK (/tmp/spark-local/)   ← shuffle files live here
+    │
+    │  Stage 1 tasks fetch over network
+    ▼
+EXECUTOR MEMORY (fetch + sort for join)
+    │
+    │  if data > available memory
+    ▼
+EXECUTOR LOCAL DISK (/tmp/spark-local/)   ← spill files live here
+    │
+    │  merge spill files → final join result
+    ▼
+EXECUTOR MEMORY (joined output rows)
+    │
+    │  write final result
+    ▼
+S3 / HDFS (output)
+```
+
+---
+
+## Key Points
+
+```
+✅ Shuffle files   → always on LOCAL DISK of executor (not HDFS, not S3)
+✅ Spill files     → also on LOCAL DISK of same executor
+✅ Memory          → only holds ONE partition chunk at a time (not 161 GB!)
+✅ Network         → used only during shuffle READ (Stage 1 fetching from Stage 0)
+
+⚠️  If local disk fills up  → DiskSpaceException → task fails → job fails
+⚠️  If executor crashes     → its shuffle files are LOST
+                             → Spark must re-run the parent stage to regenerate them
+
+Production config:
+    spark.local.dir = /fast-ssd/spark-temp   ← always use SSD, not HDD
+    (multiple dirs for multiple disks = more I/O bandwidth)
+    spark.local.dir = /ssd1/spark,/ssd2/spark,/ssd3/spark
+```
+
+---
+
+## Why It Works Despite 161 GB > 12 GB Cluster Memory
+
+```
+Because Spark NEVER loads 161 GB into memory at once.
+
+At any moment, one task holds:
+    - 1 input partition in memory  = 128 MB
+    - 1 shuffle fetch buffer       = ~200-400 MB
+    - 1 sort buffer                = remainder of task memory
+
+Everything else sits on LOCAL DISK, waiting its turn.
+
+This is exactly why local disk speed is critical for shuffle-heavy jobs.
+Slow disk = slow shuffle = slow job.
+```
+

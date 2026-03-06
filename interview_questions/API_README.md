@@ -816,3 +816,305 @@ def handle_validation_error(e):
 | DB unavailable               | `ServiceUnavailableError` | 503       |
 
 
+
+
+# I Questions
+
+## Can a `PUT` API do all of the things that `GET` do?
+
+The short answer is **technically yes, but you absolutely should not** — and here is the full reasoning.
+
+---
+
+### What GET and PUT Are Designed to Do
+
+**GET** is designed purely to **retrieve** a resource. It carries its parameters in the URL query string. It has no request body. It is read-only by contract.
+
+```http
+GET /users?id=123
+```
+
+**PUT** is designed to **create or replace** a resource at a known URL. It carries data in the request body. It is a write operation by contract.
+
+```http
+PUT /users/123
+Content-Type: application/json
+
+{ "name": "John", "age": 30 }
+```
+
+---
+
+### Can PUT Technically Do Everything GET Does?
+
+Technically, yes. HTTP is just a protocol. Nothing physically stops you from:
+
+- Using PUT to fetch and return data without modifying anything
+- Passing query parameters in a PUT request's URL
+- Returning a response body from a PUT request just like GET does
+
+The server decides what to do with any request. You could write a server that responds to `PUT /users/123` by just reading and returning the user, ignoring the body entirely.
+
+So **mechanically**, PUT can do what GET does. But this is where the similarity ends.
+
+---
+
+### Why You Should Never Use PUT in Place of GET
+
+#### Safety
+
+GET is defined as a **safe method** — it should have no side effects. A client, browser, or proxy can call it freely, knowing nothing will change on the server.
+
+PUT is **not safe** — it is explicitly meant to modify state. If something calls your PUT endpoint thinking it is safe, it may inadvertently trigger writes.
+
+#### Idempotency
+
+Both GET and PUT are **idempotent** — calling them multiple times produces the same result. This is one thing they share. But idempotency alone does not make PUT a substitute for GET.
+
+#### Caching
+
+This is one of the biggest practical differences. GET responses are **automatically cached** by browsers, CDNs, and proxies. This is a core part of how the web performs at scale.
+
+PUT responses are **never cached** by default. Replacing GET with PUT means you lose all HTTP-level caching instantly — every request hits your server, even if the data hasn't changed.
+
+#### Browser and Tool Behavior
+
+Browsers handle GET natively — you can type a GET URL directly in the address bar, bookmark it, share it, and reload it safely.
+
+PUT requests cannot be triggered from a browser address bar. They require JavaScript (`fetch`, `XMLHttpRequest`) or a tool like Postman/curl. This breaks a huge amount of standard web behavior.
+
+#### Semantics and Contracts
+
+REST and HTTP are built on shared contracts. When another developer, a load balancer, a CDN, a crawler, or a monitoring tool sees a GET request, they know exactly what to expect — read-only, cacheable, safe to retry.
+
+When they see PUT, they expect a write operation. Using PUT to read data violates this contract silently, causing confusion, bugs, and incorrect behavior in any system that relies on HTTP semantics.
+
+#### Request Body
+
+GET requests **should not have a request body**. Some servers, proxies, and clients will strip or ignore a GET body entirely. PUT expects a body. This is a structural incompatibility if you try to pass data the way PUT normally does.
+
+#### Firewalls and Security Layers
+
+Many corporate firewalls, API gateways, and WAFs (Web Application Firewalls) are configured to block or scrutinize PUT/POST/DELETE requests more aggressively than GET. Using PUT for reads could cause your requests to be blocked in environments where GET would pass freely.
+
+---
+
+### What GET Can Do That PUT Fundamentally Cannot Replace
+
+| Capability | GET | PUT |
+|---|---|---|
+| Automatic browser caching | Yes | No |
+| CDN and proxy caching | Yes | No |
+| Bookmarkable URLs | Yes | No |
+| Typeable in browser address bar | Yes | No |
+| Safe to retry automatically | Yes | No (assumed to modify state) |
+| Web crawlers index it | Yes | No |
+| Shareable links | Yes | No |
+| Safe method by HTTP spec | Yes | No |
+
+---
+
+### The One Case Where PUT Carries Something GET Cannot
+
+GET cannot have a request body in any meaningful way. So if you need to **send a complex query payload** — a deeply nested JSON filter, for example — GET cannot carry it easily (URL length limits, encoding complexity).
+
+Some APIs use POST for this reason (`POST /search` with a JSON body). A few controversial APIs use GET with a body, which technically works but is not recommended. PUT could theoretically carry complex query input in its body — but this would still be a misuse of PUT's semantics. The right answer in this case is POST.
+
+---
+
+### Summary
+
+| | GET | PUT |
+|---|---|---|
+| Primary purpose | Read / retrieve | Create or replace |
+| Request body | No | Yes |
+| Response caching | Yes — automatic | No |
+| Safe method | Yes | No |
+| Idempotent | Yes | Yes |
+| Browser native support | Full | Requires JS |
+| Semantically correct for reads | Yes | No |
+
+**PUT can mimic GET's mechanical behavior, but it loses caching, safety, browser support, semantic correctness, and HTTP-level interoperability the moment you use it that way.** They are designed for fundamentally different purposes, and HTTP's entire ecosystem — browsers, CDNs, proxies, crawlers — is built around respecting that distinction.
+
+
+## can a `GET` API do all of the things that `PUT` do?
+
+
+The short answer is **no** — and unlike the reverse question, this is not even a "technically yes but shouldn't." GET is fundamentally incapable of doing what PUT is designed to do, both by specification and by practical enforcement.
+
+---
+
+### What PUT Is Designed to Do
+
+PUT is designed to **create or replace** a resource at a known URL. It sends data in a **request body** and signals to the server: "replace whatever is at this URL with what I am sending."
+
+```http
+PUT /users/123
+Content-Type: application/json
+
+{ "name": "John", "age": 30 }
+```
+
+It is a **write operation** — it modifies server state. It is not safe, but it is idempotent (calling it multiple times with the same body produces the same result).
+
+---
+
+### What GET Is Designed to Do
+
+GET is designed purely to **retrieve** a resource. It carries parameters in the URL query string. It has **no request body**. It must not modify server state.
+
+```http
+GET /users/123
+```
+
+It is a **read operation** — safe, cacheable, idempotent, and side-effect free.
+
+---
+
+### Can GET Technically Do Everything PUT Does?
+
+**No — not even mechanically.** Here is why, point by point.
+
+---
+
+### Reason 1: GET Cannot Carry a Request Body
+
+This is the most fundamental blocker. PUT sends data to the server via a **request body** — that is how the resource content is transmitted.
+
+GET has **no request body** by design. The HTTP specification (RFC 7231) explicitly states that a GET request should not include a body, and that any body present has no defined semantics.
+
+In practice:
+- Many servers will **silently ignore** a GET request body
+- Many HTTP clients, proxies, and load balancers will **strip** the body before it reaches the server
+- Some clients (like certain versions of curl and HttpClient) will **refuse** to send a GET with a body at all
+
+So if your PUT sends `{ "name": "John", "age": 30 }` in the body, GET simply has no reliable mechanism to carry that data to the server.
+
+The only alternative is to encode data into the **URL query string**:
+
+```http
+GET /users/123?name=John&age=30
+```
+
+But this breaks down immediately for:
+- **Large payloads** — URLs have a length limit of ~2000 characters in most browsers and servers
+- **Complex nested data** — JSON objects, arrays, and nested structures cannot be cleanly encoded in a query string
+- **Binary data** — files, images, blobs cannot be sent via URL
+- **Sensitive data** — query strings appear in server logs, browser history, and referrer headers — sending passwords or tokens this way is a security risk
+
+---
+
+### Reason 2: GET Is a Safe Method — It Must Not Modify State
+
+The HTTP specification defines GET as a **safe method**. Safe means: calling it must produce **no side effects** on the server. The server state must remain unchanged.
+
+PUT is explicitly an **unsafe method** — its entire purpose is to change server state by creating or replacing a resource.
+
+You cannot implement PUT's behavior using GET without violating GET's safety contract. If your GET endpoint creates or updates a resource, you are breaking HTTP semantics — and the consequences are real:
+
+- **Browsers prefetch GET URLs** — Chrome and other browsers speculatively fetch links in the background. If your GET modifies data, random prefetch requests will trigger unintended writes
+- **Web crawlers** like Googlebot will call your GET URLs. If those calls modify data, a crawler visiting your site will corrupt your database
+- **Monitoring tools, health checks, and uptime bots** repeatedly call GET endpoints. Every health check would trigger a write
+- **HTTP caches** may serve a cached response to what should have been a fresh write, meaning clients get stale confirmations
+
+---
+
+### Reason 3: GET Responses Are Cached — PUT Responses Are Not
+
+GET responses are **automatically cached** by browsers, CDNs, and proxies. This is a feature for reads — but it becomes a disaster for writes.
+
+If you use GET to create or update a resource:
+
+```http
+GET /users/123?name=John&age=30   ← creates/updates user 123
+```
+
+The browser caches this response. The next time the same URL is called — even with different intent — the browser returns the **cached response without hitting the server**. The write never happens. The client has no idea.
+
+PUT is explicitly **not cached** — every PUT request reaches the server, guaranteed.
+
+---
+
+### Reason 4: Idempotency Semantics Are Different
+
+Both GET and PUT are idempotent — but for different reasons and with different meanings.
+
+GET is idempotent because it **reads without writing** — of course calling it multiple times gives the same result, nothing changes.
+
+PUT is idempotent because **replacing a resource with the same content multiple times leaves it in the same state** — the write happens every time, but the end state is consistent.
+
+Using GET to simulate PUT collapses this distinction. You lose the ability to reason about whether a write actually occurred, because GET's caching may have intercepted the call entirely.
+
+---
+
+### Reason 5: Security — Sensitive Data in URLs
+
+PUT sends sensitive data in the **request body**, which is:
+- Not stored in browser history
+- Not stored in server access logs (by default)
+- Not leaked in the `Referer` header to third parties
+- Not visible in the browser address bar
+
+GET data lives in the **URL**, which is:
+- Stored in browser history
+- Stored in server access logs in plaintext
+- Leaked in `Referer` headers when navigating away
+- Visible to anyone looking at the screen
+
+If your PUT is sending a password, an API key, personal information, or any sensitive payload — encoding it into a GET URL is a serious security vulnerability.
+
+---
+
+### Reason 6: HTTP Method Semantics and Middleware Behavior
+
+The entire HTTP ecosystem — load balancers, API gateways, WAFs, reverse proxies, CDNs — makes decisions based on HTTP method:
+
+- **Caches** store GET, skip PUT
+- **CDNs** may serve GET from edge nodes, always forward PUT to origin
+- **WAFs** apply different rule sets to GET vs PUT/POST
+- **CORS preflight** is triggered differently for GET vs PUT
+- **Rate limiters** may apply different limits per method
+- **API gateways** route, throttle, and log based on method
+
+Using GET to do what PUT does breaks all of these layers silently. Your infrastructure will treat the request as a safe read when it is actually a write, with unpredictable consequences at every layer.
+
+---
+
+### What GET Can Never Do That PUT Can
+
+| Capability | PUT | GET |
+|---|---|---|
+| Send large payloads to server | Yes — request body | No — URL only, length limited |
+| Send complex nested JSON | Yes — request body | No — not reliably encodable in URL |
+| Send binary / file data | Yes — request body | No |
+| Modify server state safely | Yes — designed for it | No — violates safe method contract |
+| Avoid browser caching of writes | Yes — not cached | No — responses are cached |
+| Keep sensitive data out of logs | Yes — body not logged | No — URL is always logged |
+| Signal write intent to infrastructure | Yes — all layers understand PUT | No — treated as read everywhere |
+| Trigger CORS preflight correctly | Yes | No — different preflight rules |
+
+---
+
+### The Verdict
+
+| | GET | PUT |
+|---|---|---|
+| Primary purpose | Read / retrieve | Create or replace |
+| Request body | No — not supported | Yes — required |
+| Modifies server state | No — must not | Yes — designed to |
+| Response caching | Yes — automatic | No |
+| Safe method | Yes | No |
+| Idempotent | Yes | Yes |
+| Sensitive data handling | Unsafe — exposed in URL | Safe — sent in body |
+| Can fully replace the other? | **No** | Technically yes, but shouldn't |
+
+GET cannot do what PUT does — not technically, not safely, not practically. The absence of a request body alone makes it impossible to reliably transmit the kind of payload PUT is designed to carry. Add caching, safety contracts, security implications, and infrastructure behavior on top, and GET is not a substitute for PUT in any meaningful sense.
+
+---
+
+### One Line to Remember
+
+> **GET asks the server a question. PUT gives the server an instruction. You cannot give an instruction through a mechanism that is designed only to ask questions.**
+
+## What will happen if all of the `GET` APIs are moved to `PUT` APIs?
+
