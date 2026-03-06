@@ -1243,7 +1243,4070 @@ compile-time estimates were wrong due to filter selectivity
         spark.sql.crossJoin.enabled = false  to catch mistakes
 ```
 
-# Bucketing vs Salting
+# Spark File Reading Internals — Complete Deep Dive
+
+---
+
+## 📌 Setup
+
+```
+Cluster:  3 Executors × 4 cores × 4 GB
+File:     employees.csv = 20 GB
+Config:   spark.sql.files.maxPartitionBytes = 128 MB (default)
+```
+
+---
+
+## 🔵 STEP 1 — How Many Partitions Are Created?
+
+```
+Total file size  = 20 GB = 20,480 MB
+Partition size   = 128 MB
+
+Number of partitions = ceil(20,480 / 128) = 160 partitions
+
+So Spark plans:
+    Partition 0:   bytes 0         → 134,217,728     (128 MB)
+    Partition 1:   bytes 134217728 → 268,435,456     (128 MB)
+    Partition 2:   bytes 268435456 → 402,653,184     (128 MB)
+    ...
+    Partition 159: bytes 19,327,352,832 → 20,480 MB  (last chunk)
+```
+
+### The Key Config Parameters That Affect This:
+
+```
+spark.sql.files.maxPartitionBytes  = 128 MB  (max size per partition)
+spark.sql.files.minPartitionNum    = total_cores (minimum partitions)
+spark.default.parallelism          = total_cores × 2 (for RDD operations)
+spark.sql.files.openCostInBytes    = 4 MB   (cost to open a file, used for small files)
+
+Formula:
+    maxSplitBytes = min(maxPartitionBytes, max(openCostInBytes, totalSize / minPartitionNum))
+
+For our case:
+    totalSize = 20 GB
+    minPartitionNum = 3 executors × 4 cores = 12
+    max(4MB, 20480MB/12) = max(4MB, 1706MB) = 1706MB
+    min(128MB, 1706MB) = 128MB  ← partition size stays 128MB
+```
+
+---
+
+## 🔵 STEP 2 — Who Decides Which Executor Reads Which Partition?
+
+### The Chain of Responsibility
+
+```
+YOU call:
+    df = spark.read.csv("path/employees.csv")
+    df.show()   ← action triggers everything
+         │
+         ▼
+DRIVER process
+    │
+    ├── SparkContext contacts FileSystem (HDFS/S3/local)
+    ├── Gets file metadata: size, block locations
+    ├── Calculates 160 partitions + their byte ranges
+    ├── Creates 160 Tasks (one per partition)
+    └── Hands task list to DAGScheduler
+         │
+         ▼
+DAGScheduler
+    │
+    └── Creates Stage 0 with 160 tasks
+         │
+         ▼
+TaskScheduler
+    │
+    ├── Maintains list of available executor slots
+    ├── 3 executors × 4 cores = 12 slots available
+    ├── Assigns tasks to executors based on DATA LOCALITY
+    └── Sends task to Executor via ExecutorBackend
+         │
+         ▼
+EXECUTOR receives task:
+    "Read bytes 134217728 → 268435456 of employees.csv"
+    Executor opens file connection and reads its assigned byte range
+```
+
+### Data Locality Tiers (Priority Order)
+
+```
+PROCESS_LOCAL   → data is in the same JVM process memory (cached RDD)
+NODE_LOCAL      → data is on the same physical machine (HDFS block on same node)
+RACK_LOCAL      → data is on a different machine but same rack
+NO_PREF         → data has no location preference (S3, databases)
+ANY             → any executor, anywhere
+
+TaskScheduler tries each tier with a wait timeout before falling back:
+    spark.locality.wait         = 3 seconds  (wait for PROCESS_LOCAL)
+    spark.locality.wait.node    = 3 seconds  (wait for NODE_LOCAL)
+    spark.locality.wait.rack    = 3 seconds  (wait for RACK_LOCAL)
+    spark.locality.wait.any     = 0 seconds  (no wait for ANY)
+```
+
+---
+
+## 🔵 STEP 3 — How Are 160 Partitions Distributed Across 3 Executors?
+
+```
+12 cores available = 12 tasks run simultaneously
+
+Wave 1  (t=0s):    Tasks 0–11   assigned (4 per executor)
+Wave 2  (t=Xs):    Tasks 12–23  assigned (as Wave 1 tasks complete)
+Wave 3  (t=2Xs):   Tasks 24–35  assigned
+...
+Wave 14 (t=13Xs):  Tasks 156–159 assigned (only 4 tasks, 8 cores idle)
+
+Total waves = ceil(160/12) ≈ 14 waves
+
+At any point in time:
+    Executor 1: reads partitions P0, P1, P2, P3   (4 simultaneous reads)
+    Executor 2: reads partitions P4, P5, P6, P7   (4 simultaneous reads)
+    Executor 3: reads partitions P8, P9, P10, P11 (4 simultaneous reads)
+
+Assignment is NOT fixed — it's dynamic:
+    If Executor 1 finishes P0 early → immediately gets P12
+    Faster executors get more tasks
+    Slower executors (GC pauses, slower disk) get fewer tasks in same time
+```
+
+---
+
+## 🔵 STEP 4 — THE CRITICAL QUESTION: How Is a Line Not Split Across Executors?
+
+This is the most important internal mechanism most people don't know.
+
+### The Problem
+
+```
+File on disk (raw bytes):
+    ...Alice,30,Engineering\nBob,25,Marketi|ng,500\nCarol...
+                             ^                  ^
+                         partition boundary  next partition starts here
+                         at byte 134217728
+
+If Spark blindly reads bytes 0→128MB and 128MB→256MB:
+    Partition 0 ends with:  "...Bob,25,Marketi"   ← INCOMPLETE ROW!
+    Partition 1 starts with: "ng,500\nCarol..."    ← INCOMPLETE ROW!
+    
+This would corrupt data. Spark prevents this with split boundary logic.
+```
+
+### The Solution — InputSplit Boundary Adjustment
+
+```
+Step 1: Spark calculates logical split at byte 134,217,728 (128 MB mark)
+
+Step 2: The InputFormat/RecordReader for the task assigned to Partition 0:
+    Opens file at byte 0
+    Reads until byte 134,217,728 (the boundary)
+    CONTINUES READING past the boundary until it finds '\n' (newline)
+    INCLUDES that partial line in Partition 0
+    Stops AFTER the newline
+
+Step 3: The RecordReader for Partition 1:
+    Opens file at byte 134,217,728 (the boundary)
+    SKIPS bytes until it finds the FIRST '\n' after the boundary
+    Starts reading from the character AFTER that '\n'
+    This ensures it doesn't re-read the line already claimed by Partition 0
+
+RESULT:
+    Partition 0 reads: bytes 0 → 134,217,792  (boundary + 64 extra bytes for partial line)
+    Partition 1 reads: bytes 134,217,793 → 268,435,456 (starts after the overrun line)
+
+Every line is complete, no line is ever split, no line is ever duplicated.
+```
+
+### Visualized
+
+```
+Raw file bytes:
+|-------- 128 MB ---------|-------- 128 MB ----------|
+
+byte: 0                134217728                268435456
+      │                    │                        │
+      │                    │←─ boundary             │
+      ▼                    ▼                        ▼
+...salary\nAlice,30,Eng\nBo|b,25,Marketing\nCarol,35|,Eng\n...
+                           ^                        ^
+                     exact 128MB mark         exact 256MB mark
+
+Partition 0 RecordReader:
+    Reads: bytes 0 → finds \n after 134217728
+    Actual end: ...Marketing\n   (includes Bob's complete row)
+    ✅ Bob's row is COMPLETE in Partition 0
+
+Partition 1 RecordReader:
+    Opens at: byte 134217728
+    Skips forward to first \n  (skips "b,25,Marketing")
+    Starts reading from: Carol,35,...
+    ✅ Carol's row is COMPLETE in Partition 1
+    ✅ Bob's row is NOT duplicated
+```
+
+### Who implements this logic?
+
+```
+For CSV files:
+    → org.apache.spark.sql.execution.datasources.csv.CSVFileFormat
+    → Uses Hadoop's LineRecordReader internally
+    → LineRecordReader handles the split boundary skip logic
+
+For Parquet files:
+    → org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
+    → Parquet is columnar + row-group aware → splits always fall on row group boundaries
+    → Row groups are self-contained → no split boundary problem exists
+
+For ORC files:
+    → Similar to Parquet — stripe boundaries used as split points
+    → ORC stripes = natural split boundaries
+
+For JSON files:
+    → org.apache.spark.sql.execution.datasources.json.JsonFileFormat
+    → Same LineRecordReader boundary logic as CSV
+
+For custom binary formats:
+    → Developer must implement custom RecordReader with proper split handling
+```
+
+---
+
+## 🔵 SCENARIO A — Reading from LOCAL FILESYSTEM
+
+### Who pulls the data?
+
+```
+Architecture:
+    Driver runs on: Machine A
+    Executor 1 on:  Machine A (same machine as driver)
+    Executor 2 on:  Machine B
+    Executor 3 on:  Machine C
+    File lives on:  Machine A's local disk /data/employees.csv
+
+Data locality situation:
+    Executor 1 (Machine A): NODE_LOCAL or PROCESS_LOCAL
+    Executor 2 (Machine B): ANY (must fetch over network)
+    Executor 3 (Machine C): ANY (must fetch over network)
+```
+
+### Step-by-step execution:
+
+```
+Step 1: Driver asks OS for file metadata
+    → file size: 20 GB
+    → file path: /data/employees.csv
+    → NO block location info (local FS has no block registry)
+
+Step 2: Driver creates 160 tasks with byte ranges
+    Each task knows: "read bytes X → Y from /data/employees.csv"
+
+Step 3: TaskScheduler assigns tasks with locality preference = NO_PREF
+    (local filesystem has no block registry, so any executor can run any task)
+
+Step 4: Executor pulls data
+    Executor 1 (same machine):
+        Opens /data/employees.csv directly from local disk ✅
+        Fast: disk read speed (~500 MB/s for SSD)
+        No network involved
+
+    Executor 2 (different machine):
+        Cannot access /data/employees.csv directly!
+        Spark does NOT automatically share local files across machines
+        
+        OPTIONS:
+        A) File must be on shared filesystem (NFS mount) accessible from all machines
+        B) File must be replicated on each machine
+        C) Use HDFS/S3 instead (designed for distributed access)
+
+    REAL LIMITATION:
+        spark.read.csv("/local/path/file.csv") on a cluster:
+        → Only works if ALL executors can see that path
+        → NFS, GPFS, or identical local files on all nodes
+        → Otherwise: FileNotFoundException on executors that can't see the file
+```
+
+### Local file read internals:
+
+```
+Executor process:
+    FileInputStream.open("/data/employees.csv")
+    FileChannel.position(134217728)   ← seek to partition start
+    FileChannel.read(buffer, 134217728, 134217728 + 128MB)
+    
+    OS kernel:
+        Checks page cache (is this file already in OS memory?)
+        If YES → zero-copy read from page cache (fast)
+        If NO  → disk I/O request → DMA transfer → page cache → JVM buffer
+
+    JVM buffer → LineRecordReader → Row objects → task processing
+```
+
+---
+
+## 🔵 SCENARIO B — Reading from HDFS (Hadoop Distributed File System)
+
+### How HDFS stores the file:
+
+```
+employees.csv = 20 GB
+
+HDFS splits file into BLOCKS (default 128 MB each):
+    Block 0:   bytes 0         → 134,217,728    stored on: DataNode 1, DataNode 2, DataNode 3
+    Block 1:   bytes 134217728 → 268,435,456    stored on: DataNode 1, DataNode 3, DataNode 2
+    Block 2:   bytes 268435456 → 402,653,184    stored on: DataNode 2, DataNode 1, DataNode 3
+    ...
+    Block 159: last chunk                        stored on: DataNode 3, DataNode 1, DataNode 2
+
+Replication factor = 3 (default)
+Each block exists on 3 different DataNodes for fault tolerance
+NameNode maintains the block → DataNode mapping (block registry)
+```
+
+### Step-by-step HDFS read:
+
+```
+Step 1: Driver contacts HDFS NameNode
+    Request: "Give me block locations for employees.csv"
+    Response: {
+        Block 0:   [DataNode1:50010, DataNode2:50010, DataNode3:50010]
+        Block 1:   [DataNode1:50010, DataNode3:50010, DataNode2:50010]
+        ...
+        Block 159: [DataNode3:50010, DataNode1:50010, DataNode2:50010]
+    }
+
+Step 2: Driver creates tasks WITH location hints
+    Task 0:   "read block 0"  preferredLocations=[DataNode1, DataNode2, DataNode3]
+    Task 1:   "read block 1"  preferredLocations=[DataNode1, DataNode3, DataNode2]
+    ...
+
+Step 3: TaskScheduler checks if any executor runs on a DataNode machine
+
+    If Executor 1 runs on DataNode1's machine:
+        Block 0 can be read locally → NODE_LOCAL
+        TaskScheduler waits up to 3 seconds to give Task 0 to Executor 1
+        → Fast: no network, disk read speed
+
+    If no executor is on any DataNode:
+        All reads are RACK_LOCAL or ANY
+        Data fetched over network from DataNode to Executor
+
+Step 4: Executor reads the HDFS block
+
+    Executor contacts HDFS NameNode:
+        "I need block 47, where is it?"
+    NameNode responds:
+        "Block 47 is on DataNode2 at port 50010"
+    Executor opens TCP connection to DataNode2:50010
+    DataNode2 streams block 47 bytes → Executor memory
+
+    Internally uses: org.apache.hadoop.hdfs.DFSInputStream
+    → Handles retry on DataNode failure
+    → Switches to replica on DataNode3 if DataNode2 is slow
+    → Checksum verification of each block
+```
+
+### HDFS vs Local — Key Difference:
+
+```
+Local filesystem:
+    File exists on ONE machine
+    Only that machine can read it directly
+    No block registry → no locality optimization
+
+HDFS:
+    File blocks spread across ALL DataNodes
+    Each block replicated 3 times
+    Block registry in NameNode → Spark knows EXACTLY where each block lives
+    Data locality optimization possible → NODE_LOCAL reads common
+    Any executor can reach any block via network if needed
+```
+
+---
+
+## 🔵 SCENARIO C — Reading from S3
+
+### S3 architecture:
+
+```
+S3 is OBJECT STORAGE — not a filesystem, not a block store
+
+employees.csv on S3:
+    s3://my-bucket/data/employees.csv
+    Single object, 20 GB
+    No blocks, no DataNodes, no NameNode
+    Stored in AWS infrastructure, unknown physical location
+    AWS exposes it via HTTPS REST API
+
+No concept of "data locality" → always NO_PREF
+```
+
+### Step-by-step S3 read:
+
+```
+Step 1: Driver talks to S3 via AWS SDK
+    HEAD request: s3://my-bucket/data/employees.csv
+    Response: {
+        ContentLength: 21,474,836,480  (20 GB)
+        ETag: "abc123..."
+        LastModified: ...
+    }
+    NO block location info (S3 is a black box)
+
+Step 2: Driver creates 160 tasks with byte ranges
+    Task 0:   bytes 0         → 134,217,728
+    Task 1:   bytes 134217728 → 268,435,456
+    ...
+    preferredLocations = []  ← empty, S3 has no locality
+
+Step 3: TaskScheduler assigns tasks to ANY available executor
+    No locality preference → tasks distributed round-robin or by availability
+
+Step 4: Executor reads from S3 using HTTP Range Request
+
+    Executor sends HTTP request:
+    GET s3://my-bucket/data/employees.csv
+    Range: bytes=134217728-268435455
+    Authorization: AWS4-HMAC-SHA256 ...
+
+    AWS S3 responds:
+    HTTP 206 Partial Content
+    [streams 128 MB of data]
+
+    Internally: S3AInputStream (hadoop-aws library)
+    → Handles authentication (AWS SigV4)
+    → Handles retry on network errors (exponential backoff)
+    → Handles multipart reads for large ranges
+    → Supports vectored I/O (Spark 3.3+): multiple byte ranges in one request
+```
+
+### S3 specific challenges and solutions:
+
+```
+Challenge 1: S3 is NOT a real filesystem
+    s3://bucket/dir/ is not a real directory
+    Listing 10,000 files in "directory" = 10,000 individual API calls
+    Very slow for large datasets with many small files
+
+    Solution:
+    → Use S3 Inventory for metadata
+    → Use Delta Lake / Iceberg for file listing optimization
+    → Avoid millions of tiny files (the "small file problem")
+
+Challenge 2: S3 Eventual Consistency (OLD — before 2020)
+    Write a file → might not be immediately visible to list operations
+    
+    Solution: S3 now provides strong read-after-write consistency (Dec 2020)
+    No longer an issue in modern Spark
+
+Challenge 3: High latency per request (~50-200ms vs ~1ms for local disk)
+    Opening many small files = thousands of API calls = seconds of overhead
+
+    Solution: spark.sql.files.openCostInBytes = 4MB
+    Spark groups small files together into one partition to minimize open calls
+
+Challenge 4: S3 throttling (rate limits)
+    Too many requests → HTTP 503 SlowDown
+
+    Solution:
+    → spark.hadoop.fs.s3a.connection.maximum = 200
+    → Use S3A committer (not the default FileOutputCommitter)
+    → Avoid listing the same prefix repeatedly
+
+Challenge 5: Network bandwidth from S3 to your cluster
+    Reading 20 GB over network is slower than local disk
+
+    Solution:
+    → Run Spark on EC2 in same AWS region as S3 bucket
+    → Use S3 Transfer Acceleration for cross-region
+    → Use Amazon EMR with EMRFS for optimized S3 access
+```
+
+---
+
+## 🔵 SCENARIO D — Reading from a SQL Database (JDBC)
+
+### Architecture:
+
+```
+spark.read
+    .format("jdbc")
+    .option("url",      "jdbc:postgresql://host:5432/mydb")
+    .option("dbtable",  "employees")
+    .option("user",     "spark_user")
+    .option("password", "****")
+    .load()
+```
+
+### The Default (Terrible) Behavior:
+
+```
+Without partitioning config:
+    Spark creates EXACTLY 1 partition
+    1 executor opens 1 JDBC connection
+    Reads ENTIRE employees table sequentially
+    Result: completely sequential, no parallelism at all
+
+Why? 
+    JDBC has no concept of "byte ranges"
+    Database doesn't expose block locations
+    Spark doesn't know how to split the table automatically
+```
+
+### The Right Way — Parallel JDBC Read:
+
+```python
+df = spark.read \
+    .format("jdbc") \
+    .option("url", "jdbc:postgresql://host:5432/mydb") \
+    .option("dbtable", "employees") \
+    .option("partitionColumn", "employee_id") \   ← numeric column to split on
+    .option("lowerBound",      "1") \              ← min value
+    .option("upperBound",      "1000000") \        ← max value
+    .option("numPartitions",   "10") \             ← 10 parallel connections
+    .load()
+```
+
+### How parallel JDBC read works internally:
+
+```
+Spark generates 10 SQL queries with WHERE clause ranges:
+
+    Task 0 (Executor 1):
+        SELECT * FROM employees WHERE employee_id >= 1       AND employee_id < 100001
+    Task 1 (Executor 1):
+        SELECT * FROM employees WHERE employee_id >= 100001  AND employee_id < 200001
+    Task 2 (Executor 2):
+        SELECT * FROM employees WHERE employee_id >= 200001  AND employee_id < 300001
+    ...
+    Task 9 (Executor 3):
+        SELECT * FROM employees WHERE employee_id >= 900001  AND employee_id <= 1000000
+
+Each task:
+    Opens its OWN JDBC connection to the database
+    Sends its WHERE-clause query
+    Streams result rows into a Spark partition
+    Closes connection when done
+
+Executor 1 opens 4 JDBC connections (4 cores)
+Executor 2 opens 3–4 JDBC connections
+Executor 3 opens 3–4 JDBC connections
+
+Warning: 10 simultaneous connections to DB → ensure DB connection pool can handle it
+Config:  .option("numPartitions", "10") should match DB connection pool size
+```
+
+### Predicate Pushdown for JDBC:
+
+```
+df.filter(col("age") > 30).select("name", "department")
+
+WITHOUT pushdown (bad):
+    SELECT * FROM employees          ← sends all data
+    Spark applies filter in memory
+
+WITH pushdown (good, Spark does this automatically for JDBC):
+    SELECT name, department FROM employees WHERE age > 30  ← DB does the work
+    Only filtered, projected data sent over network
+
+Config: spark.sql.jdbc.dialect  ← Spark uses DB-specific SQL dialect
+Supported: PostgreSQL, MySQL, Oracle, SQL Server, DB2, etc.
+```
+
+### JDBC Line Boundary Equivalent:
+
+```
+No line boundary problem for JDBC!
+
+Why? Database returns complete rows via ResultSet
+    ResultSet.next() → always returns one complete row
+    No concept of byte ranges or partial rows
+    The JDBC driver handles all protocol-level framing
+
+The "split boundary" problem only exists for flat files (CSV, JSON, text)
+    because they're raw bytes without row framing
+```
+
+---
+
+## 🔵 SCENARIO E — Reading Many Small Files (The Small File Problem)
+
+### Setup:
+
+```
+Instead of 1 file of 20 GB:
+    10,000 files × 2 MB each = 20 GB total
+
+Default behavior:
+    Each file = 1 partition (even though 2 MB << 128 MB limit)
+    Result: 10,000 partitions = 10,000 tasks
+
+Problems:
+    10,000 tasks ÷ 12 cores = 834 waves of execution
+    Each task: open file (50ms overhead) + read 2 MB + close file
+    Overhead dominates actual work
+    Task scheduling overhead is massive
+```
+
+### How Spark handles this — File Coalescing:
+
+```
+spark.sql.files.openCostInBytes = 4 MB (default)
+
+This config says: "treat each file open as if it costs 4 MB of data"
+
+Packing algorithm:
+    Start new partition (budget = 128 MB)
+    
+    File 1: 2 MB data + 4 MB open cost = 6 MB → pack into partition 0 (budget: 122 MB left)
+    File 2: 2 MB data + 4 MB open cost = 6 MB → pack into partition 0 (budget: 116 MB left)
+    File 3: 2 MB data + 4 MB open cost = 6 MB → pack into partition 0 (budget: 110 MB left)
+    ...
+    File 21: would exceed 128 MB budget → start partition 1
+    
+    Files per partition = 128 MB / 6 MB ≈ 21 files
+    Total partitions = 10,000 / 21 ≈ 477 partitions
+
+477 partitions ÷ 12 cores = 40 waves  ← much better than 834!
+```
+
+### Solution for extreme small file problems:
+
+```python
+# Option 1: Increase partition size to pack more files
+spark.conf.set("spark.sql.files.maxPartitionBytes", str(256 * 1024 * 1024))  # 256MB
+
+# Option 2: Explicitly coalesce after reading
+df = spark.read.csv("s3://bucket/many-small-files/*")
+df = df.coalesce(160)  # reduce from 477 to 160 partitions
+
+# Option 3: Use wholeTextFiles (for very tiny files)
+rdd = sc.wholeTextFiles("s3://bucket/many-small-files/*", minPartitions=160)
+
+# Option 4: Fix upstream — write larger files
+df.write.option("maxRecordsPerFile", 1000000).parquet("output/")
+```
+
+---
+
+## 🔵 SCENARIO F — Reading Parquet Files (Columnar Format)
+
+### How Parquet splits differently from CSV:
+
+```
+Parquet file internal structure:
+    ┌─────────────────────────────────┐
+    │  File Header (magic bytes)      │
+    ├─────────────────────────────────┤
+    │  Row Group 0  (e.g., 128 MB)    │  ← natural split boundary
+    │    Column chunk: name           │
+    │    Column chunk: age            │
+    │    Column chunk: salary         │
+    ├─────────────────────────────────┤
+    │  Row Group 1  (e.g., 128 MB)    │  ← natural split boundary
+    │    Column chunk: name           │
+    │    Column chunk: age            │
+    │    Column chunk: salary         │
+    ├─────────────────────────────────┤
+    │  ...                            │
+    ├─────────────────────────────────┤
+    │  File Footer (schema + metadata)│
+    └─────────────────────────────────┘
+
+Each Row Group = one Spark partition
+No split boundary adjustment needed — Row Groups are self-contained
+```
+
+### Column Pruning — Why Parquet is much faster:
+
+```
+Query: SELECT name, salary FROM employees WHERE age > 30
+
+CSV read:
+    Must read ALL bytes of all columns: name, age, salary, department, phone...
+    Then discard unwanted columns in memory
+
+Parquet read:
+    Only reads column chunks for: name, age, salary
+    Completely SKIPS column chunks for: department, phone, email, ...
+    For age > 30 filter: reads age column first, builds bitmask of matching rows
+    Then only fetches those specific rows from name and salary columns
+    
+Result: if you select 3 of 20 columns, Parquet reads only 15% of the data
+```
+
+### Row Group Statistics — Predicate Pushdown:
+
+```
+Parquet stores min/max statistics per Row Group per column:
+    Row Group 0: age min=18, max=25
+    Row Group 1: age min=26, max=35
+    Row Group 2: age min=36, max=65
+
+Query: WHERE age > 30
+
+Spark reads footer statistics BEFORE reading any Row Group data:
+    Row Group 0: max=25, 25 < 30 → SKIP ENTIRE ROW GROUP ✅ (128 MB saved!)
+    Row Group 1: min=26, max=35, overlaps 30 → must read
+    Row Group 2: min=36, 36 > 30 → read all rows (all match)
+
+This is "Parquet predicate pushdown" — skip entire chunks before reading
+```
+
+---
+
+## 🔵 SCENARIO G — Reading a Compressed File (gzip vs snappy vs lz4)
+
+### Splittable vs Non-Splittable compression:
+
+```
+NON-SPLITTABLE formats:
+    .csv.gz   (gzip)
+    .csv.bz2  (bzip2 — actually splittable but rare)
+    .csv.zip
+
+    Problem:
+        gzip is a STREAM compression — must decompress from byte 0
+        Cannot seek to byte 134,217,728 and start decompressing
+        Therefore: entire file = 1 partition, 1 task, NO parallelism
+
+    employees.csv.gz = 20 GB compressed
+    → 1 partition
+    → 1 task
+    → 1 executor reads and decompresses entire file
+    → Other 11 cores sit idle
+    → Very slow
+
+SPLITTABLE formats:
+    .parquet  (internally splittable by row groups)
+    .orc      (internally splittable by stripes)
+    .avro     (splittable with sync markers)
+    .csv.snappy (snappy-compressed parquet/avro is splittable)
+    .bz2      (has sync points every 900KB — technically splittable)
+    .lz4      (in certain container formats)
+
+    For splittable formats:
+        Each split can be decompressed independently
+        Full parallelism maintained
+
+RULE: Never store large datasets as .csv.gz on a cluster
+      Always use Parquet + Snappy for analytical workloads
+```
+
+---
+
+## 🔵 SCENARIO H — Schema Inference (inferSchema=True) — The Hidden Cost
+
+```python
+df = spark.read.csv("employees.csv", header=True, inferSchema=True)
+```
+
+### What inferSchema actually does:
+
+```
+Step 1: Spark runs a SEPARATE FULL SCAN of the entire file
+    → Reads all 20 GB
+    → Samples values from each column
+    → Determines types: is "age" always an integer? could it be double? string?
+
+Step 2: Type resolution rules:
+    All values parseable as Int → IntegerType
+    Any value is float → DoubleType
+    Any value is non-numeric → StringType
+    All values are "true"/"false" → BooleanType
+
+Step 3: Returns inferred schema to Driver
+Step 4: SECOND full scan happens when action is called
+
+Total: 20 GB read TWICE (once for schema, once for data)
+
+Performance fix:
+    Provide schema explicitly:
+    from pyspark.sql.types import *
+    schema = StructType([
+        StructField("name",       StringType(),  True),
+        StructField("age",        IntegerType(), True),
+        StructField("department", StringType(),  True),
+        StructField("salary",     DoubleType(),  True)
+    ])
+    df = spark.read.csv("employees.csv", header=True, schema=schema)
+    → Only ONE scan, schema not inferred
+```
+
+---
+
+## 🔵 SCENARIO I — What Happens When a Read Task Fails?
+
+```
+Task 5 is reading partition 5 (bytes 640MB → 768MB) from HDFS
+Executor 2 crashes mid-read
+
+Step 1: Executor 2 stops sending heartbeats to Driver
+Step 2: Driver detects timeout (spark.network.timeout = 120s default)
+Step 3: Driver marks Task 5 as FAILED
+Step 4: Driver marks all tasks running on Executor 2 as FAILED
+Step 5: TaskScheduler re-queues failed tasks
+Step 6: Cluster Manager launches new Executor 4 (replacement)
+Step 7: Task 5 re-assigned to Executor 4
+Step 8: Executor 4 reads from HDFS:
+    Contacts NameNode: "where is block 5?"
+    NameNode: "DataNode 1 and DataNode 3 have it" (replica!)
+    Executor 4 reads from DataNode 1 → success
+
+Why this works:
+    HDFS replication = 3 → even if one DataNode is down, 2 replicas remain
+    S3 → AWS handles redundancy internally, always available
+    Local filesystem → if the machine is down, the data is gone → job fails
+
+Config:
+    spark.task.maxFailures = 4  ← retry each task up to 4 times before giving up
+```
+
+---
+
+## 📊 Complete Comparison Table
+
+```
+┌─────────────────┬──────────────┬────────────────────┬─────────────────┬───────────────┐
+│ Aspect          │ Local FS     │ HDFS               │ S3              │ JDBC          │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Block/split     │ No blocks    │ 128 MB blocks       │ No blocks       │ No blocks     │
+│ registry        │             │ in NameNode        │                 │               │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Data locality   │ NO_PREF      │ NODE_LOCAL possible│ NO_PREF (always)│ NO_PREF       │
+│                 │             │                    │                 │               │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Who pulls data  │ Executor     │ Executor from      │ Executor via    │ Executor via  │
+│                 │ direct read  │ DataNode TCP conn  │ HTTPS GET Range │ JDBC TCP conn │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Split boundary  │ LineRecord   │ LineRecordReader   │ LineRecord      │ N/A           │
+│ handling        │ Reader       │                    │ Reader          │ (DB rows)     │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Fault tolerance │ ❌ Single    │ ✅ 3x replication  │ ✅ AWS managed  │ ✅ DB managed  │
+│                 │ point        │                    │                 │               │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Parallelism     │ Limited      │ ✅ Full parallel   │ ✅ Full parallel │ Needs config  │
+│                 │ (shared FS)  │                    │                 │               │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Line boundary   │ LineRecord   │ LineRecordReader   │ LineRecord      │ ResultSet     │
+│ guarantee       │ Reader skip  │ skip logic         │ Reader skip     │ (auto, rows)  │
+└─────────────────┴──────────────┴────────────────────┴─────────────────┴───────────────┘
+```
+
+---
+
+## 🧠 Scenarios You Might Not Have Thought to Ask
+
+### Q1: What if the file has Windows line endings (\r\n)?
+
+```
+LineRecordReader handles both \n and \r\n
+When it finds the split boundary, it searches for \n
+Automatically strips \r if present before \n
+Result: rows work correctly regardless of OS line endings
+```
+
+### Q2: What if one row is 200 MB (larger than partition size)?
+
+```
+A single row > 128 MB:
+    Partition 0 tries to read up to 128 MB → finds no \n → keeps reading
+    Reads entire 200 MB row into memory (crosses partition boundary)
+    Next partition starts after that row
+    Result: Partition 0 = 200 MB (larger than configured 128 MB)
+    
+    Spark DOES NOT split a single row across partitions
+    Memory impact: that executor task needs > 128 MB just for one row
+    If row is extremely large → executor OOM possible
+```
+
+### Q3: What if the CSV has quoted fields with newlines inside?
+
+```
+Example:
+    Alice,30,"Engineering
+    Department",90000
+
+LineRecordReader splits on \n → would break "Engineering\nDepartment" into two records!
+
+Solution:
+    spark.read.option("multiLine", "true").csv(...)
+
+With multiLine=true:
+    Spark uses a different reader (not LineRecordReader)
+    Reads entire file into one partition (no parallel split)
+    Parser handles quoted multiline fields correctly
+    
+    Trade-off: loses parallelism → entire file = 1 task
+    For large multiline CSV files: consider converting to Parquet instead
+```
+
+### Q4: What if you read a directory, not a file?
+
+```
+spark.read.csv("s3://bucket/data/")
+
+Behavior:
+    Spark lists ALL files in the directory recursively
+    Treats each file as a source
+    Creates partitions spanning multiple files
+    Files are processed in parallel
+
+Gotcha: hidden files and SUCCESS files
+    _SUCCESS file (written by Spark after job) → NOT read (underscore prefix ignored)
+    _metadata file → NOT read
+    .crc files → NOT read (dot prefix ignored)
+
+Config to control recursion:
+    spark.hadoop.mapreduce.input.fileinputformat.input.dir.recursive = true
+```
+
+### Q5: What if you read a Hive partitioned directory?
+
+```
+data/
+    year=2023/month=01/part-0.parquet
+    year=2023/month=02/part-0.parquet
+    year=2024/month=01/part-0.parquet
+
+spark.read.parquet("data/")
+    → Spark reads directory structure
+    → Automatically detects partition columns (year, month) from folder names
+    → Adds year and month as columns in DataFrame (partition discovery)
+
+Partition pruning:
+    df.filter(col("year") == 2024)
+    → Spark ONLY reads year=2024/ directory
+    → year=2023/ directories never opened → massive I/O savings
+    → No data even requested from S3/HDFS for pruned partitions
+```
+
+### Q6: What if two tasks try to read the same block simultaneously?
+
+```
+HDFS:
+    DataNode handles concurrent reads fine
+    Multiple executors can request the same block simultaneously
+    DataNode streams to each requester independently
+    No locking, fully parallel
+
+S3:
+    S3 is stateless HTTP — handles unlimited concurrent GET requests
+    No issue at all
+
+Local filesystem:
+    OS page cache shared → second reader gets data from cache (fast)
+    Concurrent reads to same file = fine (read-only, no locking needed)
+```
+
+### Q7: What happens to the data in memory after a partition is processed?
+
+```
+Task completes processing partition → output written to shuffle files or result
+JVM Garbage Collector reclaims the memory
+Next task assigned to same executor slot
+New task reads its own partition into memory
+
+Memory is REUSED across tasks — Spark doesn't hold all 160 partitions in memory
+At any time, only 12 partitions (one per active task) are in executor memory
+
+Exception: if you call df.cache() / df.persist()
+    Processed partitions stored in executor memory as RDD[InternalRow]
+    Cached partitions survive task completion
+    Used on next action without re-reading from disk/S3
+```
+
+### Q8: What if S3 file is modified while Spark is reading it?
+
+```
+S3 object modified mid-read:
+    S3 objects are IMMUTABLE — you cannot modify, only replace entirely
+    Replace = new version with new ETag
+    
+    If file replaced during a Spark job:
+        Tasks reading old version: continue reading (S3 serves old version briefly)
+        Tasks starting later: might get new version
+        Result: some partitions from old file, some from new → corrupt dataset
+
+Solution:
+    Never modify files being read by active Spark jobs
+    Use Delta Lake / Iceberg for ACID transactions on data lakes
+    These table formats use transaction logs to handle concurrent read/write
+```
+
+### Q9: What is Vectorized Reading and how does it help?
+
+```
+Traditional reading (row-at-a-time):
+    RecordReader → parse Row 1 → process → parse Row 2 → process → ...
+    One function call per row → high overhead
+
+Vectorized reading (Spark 2.3+ for Parquet, ORC):
+    RecordReader → parse 4096 rows at once into columnar batch
+    Process entire batch in tight CPU loop
+    Returns ColumnarBatch instead of Row
+
+Benefits:
+    CPU SIMD instructions can process multiple values simultaneously
+    Better CPU cache utilization (all age values contiguous in memory)
+    Fewer JVM function calls → less overhead
+    
+Enable:
+    spark.sql.parquet.enableVectorizedReader = true   (default for Parquet)
+    spark.sql.orc.enableVectorizedReader    = true    (default for ORC)
+
+NOT available for CSV/JSON (text parsing is inherently row-at-a-time)
+```
+
+### Q10: What is the Driver's role during reading vs execution?
+
+```
+During PLANNING (Driver is busy):
+    ✅ Contact filesystem for metadata
+    ✅ Calculate partition byte ranges
+    ✅ Run Catalyst optimizer
+    ✅ Create Physical Plan
+    ✅ Create tasks and assign to executors
+
+During EXECUTION (Driver mostly idle):
+    ✅ Monitor task progress via heartbeats
+    ✅ Handle task failures and re-assignment
+    ✅ Collect results if action = collect() / show()
+    ❌ Driver does NOT read data (executors do)
+    ❌ Driver does NOT process rows (executors do)
+
+    Driver is the "coordinator" — not a worker
+    If Driver OOM: usually caused by collect() pulling too much data to Driver
+```
+
+# Spark File Reading Internals — Complete Deep Dive
+
+---
+
+## 📌 Setup
+
+```
+Cluster:  3 Executors × 4 cores × 4 GB
+File:     employees.csv = 20 GB
+Config:   spark.sql.files.maxPartitionBytes = 128 MB (default)
+```
+
+---
+
+## 🔵 STEP 1 — How Many Partitions Are Created?
+
+```
+Total file size  = 20 GB = 20,480 MB
+Partition size   = 128 MB
+
+Number of partitions = ceil(20,480 / 128) = 160 partitions
+
+So Spark plans:
+    Partition 0:   bytes 0         → 134,217,728     (128 MB)
+    Partition 1:   bytes 134217728 → 268,435,456     (128 MB)
+    Partition 2:   bytes 268435456 → 402,653,184     (128 MB)
+    ...
+    Partition 159: bytes 19,327,352,832 → 20,480 MB  (last chunk)
+```
+
+### The Key Config Parameters That Affect This:
+
+```
+spark.sql.files.maxPartitionBytes  = 128 MB  (max size per partition)
+spark.sql.files.minPartitionNum    = total_cores (minimum partitions)
+spark.default.parallelism          = total_cores × 2 (for RDD operations)
+spark.sql.files.openCostInBytes    = 4 MB   (cost to open a file, used for small files)
+
+Formula:
+    maxSplitBytes = min(maxPartitionBytes, max(openCostInBytes, totalSize / minPartitionNum))
+
+For our case:
+    totalSize = 20 GB
+    minPartitionNum = 3 executors × 4 cores = 12
+    max(4MB, 20480MB/12) = max(4MB, 1706MB) = 1706MB
+    min(128MB, 1706MB) = 128MB  ← partition size stays 128MB
+```
+
+---
+
+## 🔵 STEP 2 — Who Decides Which Executor Reads Which Partition?
+
+### The Chain of Responsibility
+
+```
+YOU call:
+    df = spark.read.csv("path/employees.csv")
+    df.show()   ← action triggers everything
+         │
+         ▼
+DRIVER process
+    │
+    ├── SparkContext contacts FileSystem (HDFS/S3/local)
+    ├── Gets file metadata: size, block locations
+    ├── Calculates 160 partitions + their byte ranges
+    ├── Creates 160 Tasks (one per partition)
+    └── Hands task list to DAGScheduler
+         │
+         ▼
+DAGScheduler
+    │
+    └── Creates Stage 0 with 160 tasks
+         │
+         ▼
+TaskScheduler
+    │
+    ├── Maintains list of available executor slots
+    ├── 3 executors × 4 cores = 12 slots available
+    ├── Assigns tasks to executors based on DATA LOCALITY
+    └── Sends task to Executor via ExecutorBackend
+         │
+         ▼
+EXECUTOR receives task:
+    "Read bytes 134217728 → 268435456 of employees.csv"
+    Executor opens file connection and reads its assigned byte range
+```
+
+### Data Locality Tiers (Priority Order)
+
+```
+PROCESS_LOCAL   → data is in the same JVM process memory (cached RDD)
+NODE_LOCAL      → data is on the same physical machine (HDFS block on same node)
+RACK_LOCAL      → data is on a different machine but same rack
+NO_PREF         → data has no location preference (S3, databases)
+ANY             → any executor, anywhere
+
+TaskScheduler tries each tier with a wait timeout before falling back:
+    spark.locality.wait         = 3 seconds  (wait for PROCESS_LOCAL)
+    spark.locality.wait.node    = 3 seconds  (wait for NODE_LOCAL)
+    spark.locality.wait.rack    = 3 seconds  (wait for RACK_LOCAL)
+    spark.locality.wait.any     = 0 seconds  (no wait for ANY)
+```
+
+---
+
+## 🔵 STEP 3 — How Are 160 Partitions Distributed Across 3 Executors?
+
+```
+12 cores available = 12 tasks run simultaneously
+
+Wave 1  (t=0s):    Tasks 0–11   assigned (4 per executor)
+Wave 2  (t=Xs):    Tasks 12–23  assigned (as Wave 1 tasks complete)
+Wave 3  (t=2Xs):   Tasks 24–35  assigned
+...
+Wave 14 (t=13Xs):  Tasks 156–159 assigned (only 4 tasks, 8 cores idle)
+
+Total waves = ceil(160/12) ≈ 14 waves
+
+At any point in time:
+    Executor 1: reads partitions P0, P1, P2, P3   (4 simultaneous reads)
+    Executor 2: reads partitions P4, P5, P6, P7   (4 simultaneous reads)
+    Executor 3: reads partitions P8, P9, P10, P11 (4 simultaneous reads)
+
+Assignment is NOT fixed — it's dynamic:
+    If Executor 1 finishes P0 early → immediately gets P12
+    Faster executors get more tasks
+    Slower executors (GC pauses, slower disk) get fewer tasks in same time
+```
+
+---
+
+## 🔵 STEP 4 — THE CRITICAL QUESTION: How Is a Line Not Split Across Executors?
+
+This is the most important internal mechanism most people don't know.
+
+### The Problem
+
+```
+File on disk (raw bytes):
+    ...Alice,30,Engineering\nBob,25,Marketi|ng,500\nCarol...
+                             ^                  ^
+                         partition boundary  next partition starts here
+                         at byte 134217728
+
+If Spark blindly reads bytes 0→128MB and 128MB→256MB:
+    Partition 0 ends with:  "...Bob,25,Marketi"   ← INCOMPLETE ROW!
+    Partition 1 starts with: "ng,500\nCarol..."    ← INCOMPLETE ROW!
+    
+This would corrupt data. Spark prevents this with split boundary logic.
+```
+
+### The Solution — InputSplit Boundary Adjustment
+
+```
+Step 1: Spark calculates logical split at byte 134,217,728 (128 MB mark)
+
+Step 2: The InputFormat/RecordReader for the task assigned to Partition 0:
+    Opens file at byte 0
+    Reads until byte 134,217,728 (the boundary)
+    CONTINUES READING past the boundary until it finds '\n' (newline)
+    INCLUDES that partial line in Partition 0
+    Stops AFTER the newline
+
+Step 3: The RecordReader for Partition 1:
+    Opens file at byte 134,217,728 (the boundary)
+    SKIPS bytes until it finds the FIRST '\n' after the boundary
+    Starts reading from the character AFTER that '\n'
+    This ensures it doesn't re-read the line already claimed by Partition 0
+
+RESULT:
+    Partition 0 reads: bytes 0 → 134,217,792  (boundary + 64 extra bytes for partial line)
+    Partition 1 reads: bytes 134,217,793 → 268,435,456 (starts after the overrun line)
+
+Every line is complete, no line is ever split, no line is ever duplicated.
+```
+
+### Visualized
+
+```
+Raw file bytes:
+|-------- 128 MB ---------|-------- 128 MB ----------|
+
+byte: 0                134217728                268435456
+      │                    │                        │
+      │                    │←─ boundary             │
+      ▼                    ▼                        ▼
+...salary\nAlice,30,Eng\nBo|b,25,Marketing\nCarol,35|,Eng\n...
+                           ^                        ^
+                     exact 128MB mark         exact 256MB mark
+
+Partition 0 RecordReader:
+    Reads: bytes 0 → finds \n after 134217728
+    Actual end: ...Marketing\n   (includes Bob's complete row)
+    ✅ Bob's row is COMPLETE in Partition 0
+
+Partition 1 RecordReader:
+    Opens at: byte 134217728
+    Skips forward to first \n  (skips "b,25,Marketing")
+    Starts reading from: Carol,35,...
+    ✅ Carol's row is COMPLETE in Partition 1
+    ✅ Bob's row is NOT duplicated
+```
+
+### Who implements this logic?
+
+```
+For CSV files:
+    → org.apache.spark.sql.execution.datasources.csv.CSVFileFormat
+    → Uses Hadoop's LineRecordReader internally
+    → LineRecordReader handles the split boundary skip logic
+
+For Parquet files:
+    → org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
+    → Parquet is columnar + row-group aware → splits always fall on row group boundaries
+    → Row groups are self-contained → no split boundary problem exists
+
+For ORC files:
+    → Similar to Parquet — stripe boundaries used as split points
+    → ORC stripes = natural split boundaries
+
+For JSON files:
+    → org.apache.spark.sql.execution.datasources.json.JsonFileFormat
+    → Same LineRecordReader boundary logic as CSV
+
+For custom binary formats:
+    → Developer must implement custom RecordReader with proper split handling
+```
+
+---
+
+## 🔵 SCENARIO A — Reading from LOCAL FILESYSTEM
+
+### Who pulls the data?
+
+```
+Architecture:
+    Driver runs on: Machine A
+    Executor 1 on:  Machine A (same machine as driver)
+    Executor 2 on:  Machine B
+    Executor 3 on:  Machine C
+    File lives on:  Machine A's local disk /data/employees.csv
+
+Data locality situation:
+    Executor 1 (Machine A): NODE_LOCAL or PROCESS_LOCAL
+    Executor 2 (Machine B): ANY (must fetch over network)
+    Executor 3 (Machine C): ANY (must fetch over network)
+```
+
+### Step-by-step execution:
+
+```
+Step 1: Driver asks OS for file metadata
+    → file size: 20 GB
+    → file path: /data/employees.csv
+    → NO block location info (local FS has no block registry)
+
+Step 2: Driver creates 160 tasks with byte ranges
+    Each task knows: "read bytes X → Y from /data/employees.csv"
+
+Step 3: TaskScheduler assigns tasks with locality preference = NO_PREF
+    (local filesystem has no block registry, so any executor can run any task)
+
+Step 4: Executor pulls data
+    Executor 1 (same machine):
+        Opens /data/employees.csv directly from local disk ✅
+        Fast: disk read speed (~500 MB/s for SSD)
+        No network involved
+
+    Executor 2 (different machine):
+        Cannot access /data/employees.csv directly!
+        Spark does NOT automatically share local files across machines
+        
+        OPTIONS:
+        A) File must be on shared filesystem (NFS mount) accessible from all machines
+        B) File must be replicated on each machine
+        C) Use HDFS/S3 instead (designed for distributed access)
+
+    REAL LIMITATION:
+        spark.read.csv("/local/path/file.csv") on a cluster:
+        → Only works if ALL executors can see that path
+        → NFS, GPFS, or identical local files on all nodes
+        → Otherwise: FileNotFoundException on executors that can't see the file
+```
+
+### Local file read internals:
+
+```
+Executor process:
+    FileInputStream.open("/data/employees.csv")
+    FileChannel.position(134217728)   ← seek to partition start
+    FileChannel.read(buffer, 134217728, 134217728 + 128MB)
+    
+    OS kernel:
+        Checks page cache (is this file already in OS memory?)
+        If YES → zero-copy read from page cache (fast)
+        If NO  → disk I/O request → DMA transfer → page cache → JVM buffer
+
+    JVM buffer → LineRecordReader → Row objects → task processing
+```
+
+---
+
+## 🔵 SCENARIO B — Reading from HDFS (Hadoop Distributed File System)
+
+### How HDFS stores the file:
+
+```
+employees.csv = 20 GB
+
+HDFS splits file into BLOCKS (default 128 MB each):
+    Block 0:   bytes 0         → 134,217,728    stored on: DataNode 1, DataNode 2, DataNode 3
+    Block 1:   bytes 134217728 → 268,435,456    stored on: DataNode 1, DataNode 3, DataNode 2
+    Block 2:   bytes 268435456 → 402,653,184    stored on: DataNode 2, DataNode 1, DataNode 3
+    ...
+    Block 159: last chunk                        stored on: DataNode 3, DataNode 1, DataNode 2
+
+Replication factor = 3 (default)
+Each block exists on 3 different DataNodes for fault tolerance
+NameNode maintains the block → DataNode mapping (block registry)
+```
+
+### Step-by-step HDFS read:
+
+```
+Step 1: Driver contacts HDFS NameNode
+    Request: "Give me block locations for employees.csv"
+    Response: {
+        Block 0:   [DataNode1:50010, DataNode2:50010, DataNode3:50010]
+        Block 1:   [DataNode1:50010, DataNode3:50010, DataNode2:50010]
+        ...
+        Block 159: [DataNode3:50010, DataNode1:50010, DataNode2:50010]
+    }
+
+Step 2: Driver creates tasks WITH location hints
+    Task 0:   "read block 0"  preferredLocations=[DataNode1, DataNode2, DataNode3]
+    Task 1:   "read block 1"  preferredLocations=[DataNode1, DataNode3, DataNode2]
+    ...
+
+Step 3: TaskScheduler checks if any executor runs on a DataNode machine
+
+    If Executor 1 runs on DataNode1's machine:
+        Block 0 can be read locally → NODE_LOCAL
+        TaskScheduler waits up to 3 seconds to give Task 0 to Executor 1
+        → Fast: no network, disk read speed
+
+    If no executor is on any DataNode:
+        All reads are RACK_LOCAL or ANY
+        Data fetched over network from DataNode to Executor
+
+Step 4: Executor reads the HDFS block
+
+    Executor contacts HDFS NameNode:
+        "I need block 47, where is it?"
+    NameNode responds:
+        "Block 47 is on DataNode2 at port 50010"
+    Executor opens TCP connection to DataNode2:50010
+    DataNode2 streams block 47 bytes → Executor memory
+
+    Internally uses: org.apache.hadoop.hdfs.DFSInputStream
+    → Handles retry on DataNode failure
+    → Switches to replica on DataNode3 if DataNode2 is slow
+    → Checksum verification of each block
+```
+
+### HDFS vs Local — Key Difference:
+
+```
+Local filesystem:
+    File exists on ONE machine
+    Only that machine can read it directly
+    No block registry → no locality optimization
+
+HDFS:
+    File blocks spread across ALL DataNodes
+    Each block replicated 3 times
+    Block registry in NameNode → Spark knows EXACTLY where each block lives
+    Data locality optimization possible → NODE_LOCAL reads common
+    Any executor can reach any block via network if needed
+```
+
+---
+
+## 🔵 SCENARIO C — Reading from S3
+
+### S3 architecture:
+
+```
+S3 is OBJECT STORAGE — not a filesystem, not a block store
+
+employees.csv on S3:
+    s3://my-bucket/data/employees.csv
+    Single object, 20 GB
+    No blocks, no DataNodes, no NameNode
+    Stored in AWS infrastructure, unknown physical location
+    AWS exposes it via HTTPS REST API
+
+No concept of "data locality" → always NO_PREF
+```
+
+### Step-by-step S3 read:
+
+```
+Step 1: Driver talks to S3 via AWS SDK
+    HEAD request: s3://my-bucket/data/employees.csv
+    Response: {
+        ContentLength: 21,474,836,480  (20 GB)
+        ETag: "abc123..."
+        LastModified: ...
+    }
+    NO block location info (S3 is a black box)
+
+Step 2: Driver creates 160 tasks with byte ranges
+    Task 0:   bytes 0         → 134,217,728
+    Task 1:   bytes 134217728 → 268,435,456
+    ...
+    preferredLocations = []  ← empty, S3 has no locality
+
+Step 3: TaskScheduler assigns tasks to ANY available executor
+    No locality preference → tasks distributed round-robin or by availability
+
+Step 4: Executor reads from S3 using HTTP Range Request
+
+    Executor sends HTTP request:
+    GET s3://my-bucket/data/employees.csv
+    Range: bytes=134217728-268435455
+    Authorization: AWS4-HMAC-SHA256 ...
+
+    AWS S3 responds:
+    HTTP 206 Partial Content
+    [streams 128 MB of data]
+
+    Internally: S3AInputStream (hadoop-aws library)
+    → Handles authentication (AWS SigV4)
+    → Handles retry on network errors (exponential backoff)
+    → Handles multipart reads for large ranges
+    → Supports vectored I/O (Spark 3.3+): multiple byte ranges in one request
+```
+
+### S3 specific challenges and solutions:
+
+```
+Challenge 1: S3 is NOT a real filesystem
+    s3://bucket/dir/ is not a real directory
+    Listing 10,000 files in "directory" = 10,000 individual API calls
+    Very slow for large datasets with many small files
+
+    Solution:
+    → Use S3 Inventory for metadata
+    → Use Delta Lake / Iceberg for file listing optimization
+    → Avoid millions of tiny files (the "small file problem")
+
+Challenge 2: S3 Eventual Consistency (OLD — before 2020)
+    Write a file → might not be immediately visible to list operations
+    
+    Solution: S3 now provides strong read-after-write consistency (Dec 2020)
+    No longer an issue in modern Spark
+
+Challenge 3: High latency per request (~50-200ms vs ~1ms for local disk)
+    Opening many small files = thousands of API calls = seconds of overhead
+
+    Solution: spark.sql.files.openCostInBytes = 4MB
+    Spark groups small files together into one partition to minimize open calls
+
+Challenge 4: S3 throttling (rate limits)
+    Too many requests → HTTP 503 SlowDown
+
+    Solution:
+    → spark.hadoop.fs.s3a.connection.maximum = 200
+    → Use S3A committer (not the default FileOutputCommitter)
+    → Avoid listing the same prefix repeatedly
+
+Challenge 5: Network bandwidth from S3 to your cluster
+    Reading 20 GB over network is slower than local disk
+
+    Solution:
+    → Run Spark on EC2 in same AWS region as S3 bucket
+    → Use S3 Transfer Acceleration for cross-region
+    → Use Amazon EMR with EMRFS for optimized S3 access
+```
+
+---
+
+## 🔵 SCENARIO D — Reading from a SQL Database (JDBC)
+
+### Architecture:
+
+```
+spark.read
+    .format("jdbc")
+    .option("url",      "jdbc:postgresql://host:5432/mydb")
+    .option("dbtable",  "employees")
+    .option("user",     "spark_user")
+    .option("password", "****")
+    .load()
+```
+
+### The Default (Terrible) Behavior:
+
+```
+Without partitioning config:
+    Spark creates EXACTLY 1 partition
+    1 executor opens 1 JDBC connection
+    Reads ENTIRE employees table sequentially
+    Result: completely sequential, no parallelism at all
+
+Why? 
+    JDBC has no concept of "byte ranges"
+    Database doesn't expose block locations
+    Spark doesn't know how to split the table automatically
+```
+
+### The Right Way — Parallel JDBC Read:
+
+```python
+df = spark.read \
+    .format("jdbc") \
+    .option("url", "jdbc:postgresql://host:5432/mydb") \
+    .option("dbtable", "employees") \
+    .option("partitionColumn", "employee_id") \   ← numeric column to split on
+    .option("lowerBound",      "1") \              ← min value
+    .option("upperBound",      "1000000") \        ← max value
+    .option("numPartitions",   "10") \             ← 10 parallel connections
+    .load()
+```
+
+### How parallel JDBC read works internally:
+
+```
+Spark generates 10 SQL queries with WHERE clause ranges:
+
+    Task 0 (Executor 1):
+        SELECT * FROM employees WHERE employee_id >= 1       AND employee_id < 100001
+    Task 1 (Executor 1):
+        SELECT * FROM employees WHERE employee_id >= 100001  AND employee_id < 200001
+    Task 2 (Executor 2):
+        SELECT * FROM employees WHERE employee_id >= 200001  AND employee_id < 300001
+    ...
+    Task 9 (Executor 3):
+        SELECT * FROM employees WHERE employee_id >= 900001  AND employee_id <= 1000000
+
+Each task:
+    Opens its OWN JDBC connection to the database
+    Sends its WHERE-clause query
+    Streams result rows into a Spark partition
+    Closes connection when done
+
+Executor 1 opens 4 JDBC connections (4 cores)
+Executor 2 opens 3–4 JDBC connections
+Executor 3 opens 3–4 JDBC connections
+
+Warning: 10 simultaneous connections to DB → ensure DB connection pool can handle it
+Config:  .option("numPartitions", "10") should match DB connection pool size
+```
+
+### Predicate Pushdown for JDBC:
+
+```
+df.filter(col("age") > 30).select("name", "department")
+
+WITHOUT pushdown (bad):
+    SELECT * FROM employees          ← sends all data
+    Spark applies filter in memory
+
+WITH pushdown (good, Spark does this automatically for JDBC):
+    SELECT name, department FROM employees WHERE age > 30  ← DB does the work
+    Only filtered, projected data sent over network
+
+Config: spark.sql.jdbc.dialect  ← Spark uses DB-specific SQL dialect
+Supported: PostgreSQL, MySQL, Oracle, SQL Server, DB2, etc.
+```
+
+### JDBC Line Boundary Equivalent:
+
+```
+No line boundary problem for JDBC!
+
+Why? Database returns complete rows via ResultSet
+    ResultSet.next() → always returns one complete row
+    No concept of byte ranges or partial rows
+    The JDBC driver handles all protocol-level framing
+
+The "split boundary" problem only exists for flat files (CSV, JSON, text)
+    because they're raw bytes without row framing
+```
+
+---
+
+## 🔵 SCENARIO E — Reading Many Small Files (The Small File Problem)
+
+### Setup:
+
+```
+Instead of 1 file of 20 GB:
+    10,000 files × 2 MB each = 20 GB total
+
+Default behavior:
+    Each file = 1 partition (even though 2 MB << 128 MB limit)
+    Result: 10,000 partitions = 10,000 tasks
+
+Problems:
+    10,000 tasks ÷ 12 cores = 834 waves of execution
+    Each task: open file (50ms overhead) + read 2 MB + close file
+    Overhead dominates actual work
+    Task scheduling overhead is massive
+```
+
+### How Spark handles this — File Coalescing:
+
+```
+spark.sql.files.openCostInBytes = 4 MB (default)
+
+This config says: "treat each file open as if it costs 4 MB of data"
+
+Packing algorithm:
+    Start new partition (budget = 128 MB)
+    
+    File 1: 2 MB data + 4 MB open cost = 6 MB → pack into partition 0 (budget: 122 MB left)
+    File 2: 2 MB data + 4 MB open cost = 6 MB → pack into partition 0 (budget: 116 MB left)
+    File 3: 2 MB data + 4 MB open cost = 6 MB → pack into partition 0 (budget: 110 MB left)
+    ...
+    File 21: would exceed 128 MB budget → start partition 1
+    
+    Files per partition = 128 MB / 6 MB ≈ 21 files
+    Total partitions = 10,000 / 21 ≈ 477 partitions
+
+477 partitions ÷ 12 cores = 40 waves  ← much better than 834!
+```
+
+### Solution for extreme small file problems:
+
+```python
+# Option 1: Increase partition size to pack more files
+spark.conf.set("spark.sql.files.maxPartitionBytes", str(256 * 1024 * 1024))  # 256MB
+
+# Option 2: Explicitly coalesce after reading
+df = spark.read.csv("s3://bucket/many-small-files/*")
+df = df.coalesce(160)  # reduce from 477 to 160 partitions
+
+# Option 3: Use wholeTextFiles (for very tiny files)
+rdd = sc.wholeTextFiles("s3://bucket/many-small-files/*", minPartitions=160)
+
+# Option 4: Fix upstream — write larger files
+df.write.option("maxRecordsPerFile", 1000000).parquet("output/")
+```
+
+---
+
+## 🔵 SCENARIO F — Reading Parquet Files (Columnar Format)
+
+### How Parquet splits differently from CSV:
+
+```
+Parquet file internal structure:
+    ┌─────────────────────────────────┐
+    │  File Header (magic bytes)      │
+    ├─────────────────────────────────┤
+    │  Row Group 0  (e.g., 128 MB)    │  ← natural split boundary
+    │    Column chunk: name           │
+    │    Column chunk: age            │
+    │    Column chunk: salary         │
+    ├─────────────────────────────────┤
+    │  Row Group 1  (e.g., 128 MB)    │  ← natural split boundary
+    │    Column chunk: name           │
+    │    Column chunk: age            │
+    │    Column chunk: salary         │
+    ├─────────────────────────────────┤
+    │  ...                            │
+    ├─────────────────────────────────┤
+    │  File Footer (schema + metadata)│
+    └─────────────────────────────────┘
+
+Each Row Group = one Spark partition
+No split boundary adjustment needed — Row Groups are self-contained
+```
+
+### Column Pruning — Why Parquet is much faster:
+
+```
+Query: SELECT name, salary FROM employees WHERE age > 30
+
+CSV read:
+    Must read ALL bytes of all columns: name, age, salary, department, phone...
+    Then discard unwanted columns in memory
+
+Parquet read:
+    Only reads column chunks for: name, age, salary
+    Completely SKIPS column chunks for: department, phone, email, ...
+    For age > 30 filter: reads age column first, builds bitmask of matching rows
+    Then only fetches those specific rows from name and salary columns
+    
+Result: if you select 3 of 20 columns, Parquet reads only 15% of the data
+```
+
+### Row Group Statistics — Predicate Pushdown:
+
+```
+Parquet stores min/max statistics per Row Group per column:
+    Row Group 0: age min=18, max=25
+    Row Group 1: age min=26, max=35
+    Row Group 2: age min=36, max=65
+
+Query: WHERE age > 30
+
+Spark reads footer statistics BEFORE reading any Row Group data:
+    Row Group 0: max=25, 25 < 30 → SKIP ENTIRE ROW GROUP ✅ (128 MB saved!)
+    Row Group 1: min=26, max=35, overlaps 30 → must read
+    Row Group 2: min=36, 36 > 30 → read all rows (all match)
+
+This is "Parquet predicate pushdown" — skip entire chunks before reading
+```
+
+---
+
+## 🔵 SCENARIO G — Reading a Compressed File (gzip vs snappy vs lz4)
+
+### Splittable vs Non-Splittable compression:
+
+```
+NON-SPLITTABLE formats:
+    .csv.gz   (gzip)
+    .csv.bz2  (bzip2 — actually splittable but rare)
+    .csv.zip
+
+    Problem:
+        gzip is a STREAM compression — must decompress from byte 0
+        Cannot seek to byte 134,217,728 and start decompressing
+        Therefore: entire file = 1 partition, 1 task, NO parallelism
+
+    employees.csv.gz = 20 GB compressed
+    → 1 partition
+    → 1 task
+    → 1 executor reads and decompresses entire file
+    → Other 11 cores sit idle
+    → Very slow
+
+SPLITTABLE formats:
+    .parquet  (internally splittable by row groups)
+    .orc      (internally splittable by stripes)
+    .avro     (splittable with sync markers)
+    .csv.snappy (snappy-compressed parquet/avro is splittable)
+    .bz2      (has sync points every 900KB — technically splittable)
+    .lz4      (in certain container formats)
+
+    For splittable formats:
+        Each split can be decompressed independently
+        Full parallelism maintained
+
+RULE: Never store large datasets as .csv.gz on a cluster
+      Always use Parquet + Snappy for analytical workloads
+```
+
+---
+
+## 🔵 SCENARIO H — Schema Inference (inferSchema=True) — The Hidden Cost
+
+```python
+df = spark.read.csv("employees.csv", header=True, inferSchema=True)
+```
+
+### What inferSchema actually does:
+
+```
+Step 1: Spark runs a SEPARATE FULL SCAN of the entire file
+    → Reads all 20 GB
+    → Samples values from each column
+    → Determines types: is "age" always an integer? could it be double? string?
+
+Step 2: Type resolution rules:
+    All values parseable as Int → IntegerType
+    Any value is float → DoubleType
+    Any value is non-numeric → StringType
+    All values are "true"/"false" → BooleanType
+
+Step 3: Returns inferred schema to Driver
+Step 4: SECOND full scan happens when action is called
+
+Total: 20 GB read TWICE (once for schema, once for data)
+
+Performance fix:
+    Provide schema explicitly:
+    from pyspark.sql.types import *
+    schema = StructType([
+        StructField("name",       StringType(),  True),
+        StructField("age",        IntegerType(), True),
+        StructField("department", StringType(),  True),
+        StructField("salary",     DoubleType(),  True)
+    ])
+    df = spark.read.csv("employees.csv", header=True, schema=schema)
+    → Only ONE scan, schema not inferred
+```
+
+---
+
+## 🔵 SCENARIO I — What Happens When a Read Task Fails?
+
+```
+Task 5 is reading partition 5 (bytes 640MB → 768MB) from HDFS
+Executor 2 crashes mid-read
+
+Step 1: Executor 2 stops sending heartbeats to Driver
+Step 2: Driver detects timeout (spark.network.timeout = 120s default)
+Step 3: Driver marks Task 5 as FAILED
+Step 4: Driver marks all tasks running on Executor 2 as FAILED
+Step 5: TaskScheduler re-queues failed tasks
+Step 6: Cluster Manager launches new Executor 4 (replacement)
+Step 7: Task 5 re-assigned to Executor 4
+Step 8: Executor 4 reads from HDFS:
+    Contacts NameNode: "where is block 5?"
+    NameNode: "DataNode 1 and DataNode 3 have it" (replica!)
+    Executor 4 reads from DataNode 1 → success
+
+Why this works:
+    HDFS replication = 3 → even if one DataNode is down, 2 replicas remain
+    S3 → AWS handles redundancy internally, always available
+    Local filesystem → if the machine is down, the data is gone → job fails
+
+Config:
+    spark.task.maxFailures = 4  ← retry each task up to 4 times before giving up
+```
+
+---
+
+## 📊 Complete Comparison Table
+
+```
+┌─────────────────┬──────────────┬────────────────────┬─────────────────┬───────────────┐
+│ Aspect          │ Local FS     │ HDFS               │ S3              │ JDBC          │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Block/split     │ No blocks    │ 128 MB blocks       │ No blocks       │ No blocks     │
+│ registry        │             │ in NameNode        │                 │               │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Data locality   │ NO_PREF      │ NODE_LOCAL possible│ NO_PREF (always)│ NO_PREF       │
+│                 │             │                    │                 │               │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Who pulls data  │ Executor     │ Executor from      │ Executor via    │ Executor via  │
+│                 │ direct read  │ DataNode TCP conn  │ HTTPS GET Range │ JDBC TCP conn │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Split boundary  │ LineRecord   │ LineRecordReader   │ LineRecord      │ N/A           │
+│ handling        │ Reader       │                    │ Reader          │ (DB rows)     │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Fault tolerance │ ❌ Single    │ ✅ 3x replication  │ ✅ AWS managed  │ ✅ DB managed  │
+│                 │ point        │                    │                 │               │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Parallelism     │ Limited      │ ✅ Full parallel   │ ✅ Full parallel │ Needs config  │
+│                 │ (shared FS)  │                    │                 │               │
+├─────────────────┼──────────────┼────────────────────┼─────────────────┼───────────────┤
+│ Line boundary   │ LineRecord   │ LineRecordReader   │ LineRecord      │ ResultSet     │
+│ guarantee       │ Reader skip  │ skip logic         │ Reader skip     │ (auto, rows)  │
+└─────────────────┴──────────────┴────────────────────┴─────────────────┴───────────────┘
+```
+
+---
+
+## 🧠 Scenarios You Might Not Have Thought to Ask
+
+### Q1: What if the file has Windows line endings (\r\n)?
+
+```
+LineRecordReader handles both \n and \r\n
+When it finds the split boundary, it searches for \n
+Automatically strips \r if present before \n
+Result: rows work correctly regardless of OS line endings
+```
+
+### Q2: What if one row is 200 MB (larger than partition size)?
+
+```
+A single row > 128 MB:
+    Partition 0 tries to read up to 128 MB → finds no \n → keeps reading
+    Reads entire 200 MB row into memory (crosses partition boundary)
+    Next partition starts after that row
+    Result: Partition 0 = 200 MB (larger than configured 128 MB)
+    
+    Spark DOES NOT split a single row across partitions
+    Memory impact: that executor task needs > 128 MB just for one row
+    If row is extremely large → executor OOM possible
+```
+
+### Q3: What if the CSV has quoted fields with newlines inside?
+
+```
+Example:
+    Alice,30,"Engineering
+    Department",90000
+
+LineRecordReader splits on \n → would break "Engineering\nDepartment" into two records!
+
+Solution:
+    spark.read.option("multiLine", "true").csv(...)
+
+With multiLine=true:
+    Spark uses a different reader (not LineRecordReader)
+    Reads entire file into one partition (no parallel split)
+    Parser handles quoted multiline fields correctly
+    
+    Trade-off: loses parallelism → entire file = 1 task
+    For large multiline CSV files: consider converting to Parquet instead
+```
+
+### Q4: What if you read a directory, not a file?
+
+```
+spark.read.csv("s3://bucket/data/")
+
+Behavior:
+    Spark lists ALL files in the directory recursively
+    Treats each file as a source
+    Creates partitions spanning multiple files
+    Files are processed in parallel
+
+Gotcha: hidden files and SUCCESS files
+    _SUCCESS file (written by Spark after job) → NOT read (underscore prefix ignored)
+    _metadata file → NOT read
+    .crc files → NOT read (dot prefix ignored)
+
+Config to control recursion:
+    spark.hadoop.mapreduce.input.fileinputformat.input.dir.recursive = true
+```
+
+### Q5: What if you read a Hive partitioned directory?
+
+```
+data/
+    year=2023/month=01/part-0.parquet
+    year=2023/month=02/part-0.parquet
+    year=2024/month=01/part-0.parquet
+
+spark.read.parquet("data/")
+    → Spark reads directory structure
+    → Automatically detects partition columns (year, month) from folder names
+    → Adds year and month as columns in DataFrame (partition discovery)
+
+Partition pruning:
+    df.filter(col("year") == 2024)
+    → Spark ONLY reads year=2024/ directory
+    → year=2023/ directories never opened → massive I/O savings
+    → No data even requested from S3/HDFS for pruned partitions
+```
+
+### Q6: What if two tasks try to read the same block simultaneously?
+
+```
+HDFS:
+    DataNode handles concurrent reads fine
+    Multiple executors can request the same block simultaneously
+    DataNode streams to each requester independently
+    No locking, fully parallel
+
+S3:
+    S3 is stateless HTTP — handles unlimited concurrent GET requests
+    No issue at all
+
+Local filesystem:
+    OS page cache shared → second reader gets data from cache (fast)
+    Concurrent reads to same file = fine (read-only, no locking needed)
+```
+
+### Q7: What happens to the data in memory after a partition is processed?
+
+```
+Task completes processing partition → output written to shuffle files or result
+JVM Garbage Collector reclaims the memory
+Next task assigned to same executor slot
+New task reads its own partition into memory
+
+Memory is REUSED across tasks — Spark doesn't hold all 160 partitions in memory
+At any time, only 12 partitions (one per active task) are in executor memory
+
+Exception: if you call df.cache() / df.persist()
+    Processed partitions stored in executor memory as RDD[InternalRow]
+    Cached partitions survive task completion
+    Used on next action without re-reading from disk/S3
+```
+
+### Q8: What if S3 file is modified while Spark is reading it?
+
+```
+S3 object modified mid-read:
+    S3 objects are IMMUTABLE — you cannot modify, only replace entirely
+    Replace = new version with new ETag
+    
+    If file replaced during a Spark job:
+        Tasks reading old version: continue reading (S3 serves old version briefly)
+        Tasks starting later: might get new version
+        Result: some partitions from old file, some from new → corrupt dataset
+
+Solution:
+    Never modify files being read by active Spark jobs
+    Use Delta Lake / Iceberg for ACID transactions on data lakes
+    These table formats use transaction logs to handle concurrent read/write
+```
+
+### Q9: What is Vectorized Reading and how does it help?
+
+```
+Traditional reading (row-at-a-time):
+    RecordReader → parse Row 1 → process → parse Row 2 → process → ...
+    One function call per row → high overhead
+
+Vectorized reading (Spark 2.3+ for Parquet, ORC):
+    RecordReader → parse 4096 rows at once into columnar batch
+    Process entire batch in tight CPU loop
+    Returns ColumnarBatch instead of Row
+
+Benefits:
+    CPU SIMD instructions can process multiple values simultaneously
+    Better CPU cache utilization (all age values contiguous in memory)
+    Fewer JVM function calls → less overhead
+    
+Enable:
+    spark.sql.parquet.enableVectorizedReader = true   (default for Parquet)
+    spark.sql.orc.enableVectorizedReader    = true    (default for ORC)
+
+NOT available for CSV/JSON (text parsing is inherently row-at-a-time)
+```
+
+### Q10: What is the Driver's role during reading vs execution?
+
+```
+During PLANNING (Driver is busy):
+    ✅ Contact filesystem for metadata
+    ✅ Calculate partition byte ranges
+    ✅ Run Catalyst optimizer
+    ✅ Create Physical Plan
+    ✅ Create tasks and assign to executors
+
+During EXECUTION (Driver mostly idle):
+    ✅ Monitor task progress via heartbeats
+    ✅ Handle task failures and re-assignment
+    ✅ Collect results if action = collect() / show()
+    ❌ Driver does NOT read data (executors do)
+    ❌ Driver does NOT process rows (executors do)
+
+    Driver is the "coordinator" — not a worker
+    If Driver OOM: usually caused by collect() pulling too much data to Driver
+```
+
+# How Number of Files Affects Spark Partitions — Complete Guide
+
+---
+
+## 📌 The Core Rule — Before Anything Else
+
+```
+Spark partition count when reading files is determined by:
+
+    max(
+        minPartitions,
+        total_bytes_across_all_files / maxPartitionBytes
+    )
+
+BUT with a critical constraint:
+    A SINGLE FILE IS NEVER SPLIT ACROSS FEWER THAN 1 PARTITION
+    and
+    A SINGLE FILE *CAN* CREATE MULTIPLE PARTITIONS if it is larger than maxPartitionBytes
+    BUT only if the file format is SPLITTABLE
+
+Splittable formats:    Parquet, ORC, Avro, uncompressed CSV/JSON, bzip2
+Non-splittable formats: gzip CSV (.csv.gz), zip, snappy CSV (not in parquet container)
+```
+
+---
+
+## 🔵 CASE 1 — One Large File
+
+### Setup
+```
+File: employees.csv = 20 GB (uncompressed, splittable)
+maxPartitionBytes = 128 MB
+Executors: 3 × 4 cores = 12 cores
+```
+
+### What happens
+```
+20 GB / 128 MB = 160 partitions
+
+Partition 0:   bytes 0         → 128 MB    → 1 task
+Partition 1:   bytes 128 MB    → 256 MB    → 1 task
+...
+Partition 159: bytes 19.875 GB → 20 GB     → 1 task
+
+Result: 160 partitions, 160 tasks, 14 waves (160/12)
+```
+
+### Visualized
+```
+employees.csv [20 GB]
+│
+├── Partition 0  [128 MB] ──→ Task 0  → Executor 1
+├── Partition 1  [128 MB] ──→ Task 1  → Executor 1
+├── Partition 2  [128 MB] ──→ Task 2  → Executor 1
+├── Partition 3  [128 MB] ──→ Task 3  → Executor 1
+│   (Executor 1 runs 4 at a time)
+├── Partition 4  [128 MB] ──→ Task 4  → Executor 2
+...
+└── Partition 159 [last]  ──→ Task 159 → Executor 3
+```
+
+---
+
+## 🔵 CASE 2 — One Large File BUT Gzip Compressed (Non-Splittable)
+
+### Setup
+```
+File: employees.csv.gz = 5 GB (compressed, was 20 GB uncompressed)
+maxPartitionBytes = 128 MB
+```
+
+### What happens
+```
+gzip is NOT splittable — cannot seek to middle and decompress
+
+Result: 1 partition, 1 task, 11 cores sit IDLE
+
+Partition 0: entire 20 GB file (after decompression) → 1 task → 1 executor
+
+The other 2 executors (8 cores) do absolutely nothing until this one task finishes
+```
+
+### Visualized
+```
+employees.csv.gz [5 GB compressed = 20 GB uncompressed]
+│
+└── Partition 0  [ENTIRE FILE] ──→ Task 0 → Executor 1 only
+                                   Executor 2: idle ❌
+                                   Executor 3: idle ❌
+
+Time to read: ~20x slower than the splittable version
+```
+
+### Fix
+```python
+# BAD — loses parallelism
+df = spark.read.csv("s3://bucket/employees.csv.gz")
+
+# GOOD — use Parquet with Snappy (splittable + compressed)
+df.write.parquet("s3://bucket/employees.parquet")  # convert once
+df = spark.read.parquet("s3://bucket/employees.parquet")  # fast parallel reads
+```
+
+---
+
+## 🔵 CASE 3 — Many Small Files (The Most Common Problem)
+
+### Setup
+```
+10,000 files × 2 MB each = 20 GB total
+maxPartitionBytes   = 128 MB
+openCostInBytes     = 4 MB  (default — cost to open one file)
+```
+
+### What naive behavior would be (WITHOUT coalescing)
+```
+One file = at minimum one partition
+10,000 files → 10,000 partitions → 10,000 tasks
+
+10,000 tasks ÷ 12 cores = 834 waves
+Each task: open file (50ms) + read 2 MB + process + close
+Overhead >> actual work
+```
+
+### What Spark ACTUALLY does — File Coalescing Algorithm
+
+```
+Spark's FilePartition packing algorithm:
+
+Budget per partition = maxPartitionBytes = 128 MB
+Cost of each file    = file_size + openCostInBytes
+                     = 2 MB    + 4 MB
+                     = 6 MB effective cost
+
+Files packed into one partition:
+    128 MB / 6 MB = 21 files per partition
+
+Total partitions = ceil(10,000 / 21) = 477 partitions
+
+477 tasks ÷ 12 cores = 40 waves  ← much better!
+```
+
+### Packing algorithm step by step
+```
+Start partition_0, budget = 128 MB
+
+file_0001.csv (2 MB) → cost = 6 MB → fits (budget left: 122 MB)
+file_0002.csv (2 MB) → cost = 6 MB → fits (budget left: 116 MB)
+file_0003.csv (2 MB) → cost = 6 MB → fits (budget left: 110 MB)
+...
+file_0021.csv (2 MB) → cost = 6 MB → fits (budget left: 2 MB)
+file_0022.csv (2 MB) → cost = 6 MB → does NOT fit (2 MB < 6 MB)
+                    → close partition_0, start partition_1
+
+partition_0 = files 0001–0021 (21 files, 42 MB actual data)
+partition_1 = starts with file_0022
+...
+
+Note: actual data in each partition = 42 MB
+      but treated as 128 MB due to open cost padding
+      This PREVENTS too many tiny partitions
+```
+
+### Visualized
+```
+BEFORE coalescing (naive):
+file_0001.csv [2MB] → Partition 0    (1 file each)
+file_0002.csv [2MB] → Partition 1
+file_0003.csv [2MB] → Partition 2
+...
+file_9999.csv [2MB] → Partition 9,999
+= 10,000 partitions ❌
+
+AFTER coalescing (what Spark does):
+files 0001–0021 → Partition 0   (21 files, 42 MB)
+files 0022–0042 → Partition 1   (21 files, 42 MB)
+files 0043–0063 → Partition 2   (21 files, 42 MB)
+...
+= 477 partitions ✅
+```
+
+---
+
+## 🔵 CASE 4 — Mix of Small and Large Files
+
+### Setup
+```
+5 files × 500 MB  = 2.5 GB  (large files)
+100 files × 1 MB  = 0.1 GB  (small files)
+Total             = 2.6 GB
+maxPartitionBytes = 128 MB
+openCostInBytes   = 4 MB
+```
+
+### What happens to large files (500 MB each)
+```
+500 MB > 128 MB → each large file gets split into multiple partitions
+
+File_A.csv (500 MB):
+    Partition 0: bytes 0     → 128 MB
+    Partition 1: bytes 128MB → 256 MB
+    Partition 2: bytes 256MB → 384 MB
+    Partition 3: bytes 384MB → 500 MB
+    = 4 partitions from File_A
+
+5 large files × 4 partitions = 20 partitions from large files
+```
+
+### What happens to small files (1 MB each)
+```
+1 MB + 4 MB open cost = 5 MB effective cost
+128 MB / 5 MB = 25 files per partition
+
+100 small files / 25 = 4 partitions from small files
+```
+
+### Total
+```
+Large files: 20 partitions
+Small files:  4 partitions
+Total:        24 partitions
+
+Without coalescing of small files: 100 + 20 = 120 partitions
+With coalescing:                          24 partitions ✅
+```
+
+---
+
+## 🔵 CASE 5 — S3 Specific: Listing Overhead
+
+### How S3 file listing works
+```
+spark.read.csv("s3://bucket/data/")
+
+Spark must LIST all files before it can plan partitions:
+
+S3 LIST API:
+    One LIST request = max 1,000 objects returned
+    10,000 files = 10 LIST requests
+    100,000 files = 100 LIST requests
+    1,000,000 files = 1,000 LIST requests
+
+Each LIST request ≈ 50-200ms latency
+1,000,000 files → 1,000 requests × 100ms = 100 seconds JUST TO LIST FILES
+
+This happens BEFORE any data is read
+This is a driver-side operation — driver is blocked during listing
+```
+
+### Visualized listing overhead
+```
+spark.read.parquet("s3://bucket/data/")  ← you call this
+         │
+         ▼
+Driver → S3 LIST s3://bucket/data/?prefix=data/&max-keys=1000
+         ← returns 1000 file names + sizes
+Driver → S3 LIST s3://bucket/data/?prefix=data/&continuation-token=abc
+         ← returns next 1000 file names + sizes
+...repeated N times...
+Driver has full file list → calculates partitions → submits tasks
+
+With 1M files:   listing = minutes
+With 10M files:  listing = tens of minutes → job appears "stuck"
+```
+
+### S3 listing solutions
+```python
+# Solution 1: Use Hive-style partitioning (partition pruning skips directories)
+s3://bucket/data/year=2024/month=01/  ← Spark only lists year=2024/month=01/
+s3://bucket/data/year=2024/month=02/  ← skipped if filter doesn't need it
+df = spark.read.parquet("s3://bucket/data/").filter("year=2024 AND month=1")
+
+# Solution 2: Delta Lake / Iceberg (transaction log replaces directory listing)
+df = spark.read.format("delta").load("s3://bucket/delta-table/")
+# Delta reads _delta_log/ JSON files instead of listing all data files
+# Listing 1M files → reading 1 transaction log file
+
+# Solution 3: Manifest files
+# Pre-generate a file listing, read from manifest
+df = spark.read.option("pathGlobFilter", "*.parquet") \
+              .parquet("s3://bucket/data/specific-prefix-*")
+```
+
+---
+
+## 🔵 CASE 6 — S3 with Hive Partitioned Data
+
+### Directory structure
+```
+s3://bucket/sales/
+    year=2022/month=01/day=01/part-00000.parquet  [500 MB]
+    year=2022/month=01/day=02/part-00000.parquet  [500 MB]
+    ...
+    year=2024/month=12/day=31/part-00000.parquet  [500 MB]
+
+Total: 3 years × 12 months × 30 days = 1,080 files × 500 MB = 540 GB
+```
+
+### Without filter (reads everything)
+```python
+df = spark.read.parquet("s3://bucket/sales/")
+
+Partitions = 540 GB / 128 MB = 4,320 partitions
+All 1,080 files listed and read
+```
+
+### With filter (partition pruning)
+```python
+df = spark.read.parquet("s3://bucket/sales/") \
+              .filter("year = 2024 AND month = 6")
+
+Spark sees filter on partition columns (year, month)
+Only lists: s3://bucket/sales/year=2024/month=6/
+Finds: 30 files (one per day) × 500 MB = 15 GB
+
+Partitions = 15 GB / 128 MB = 120 partitions
+Only 30 files read (not 1,080)
+S3 LIST calls: 1 (not 1,080)
+
+Speedup: 36x less data read, 36x fewer partitions
+```
+
+---
+
+## 🔵 HOW TO CONTROL PARTITION COUNT — All Methods
+
+### Method 1: Change maxPartitionBytes (affects read-time splitting)
+
+```python
+# Increase partition size → fewer, larger partitions
+spark.conf.set("spark.sql.files.maxPartitionBytes", str(256 * 1024 * 1024))  # 256 MB
+df = spark.read.csv("s3://bucket/data/")
+
+# 20 GB / 256 MB = 80 partitions (was 160 at 128 MB)
+
+# Decrease partition size → more, smaller partitions
+spark.conf.set("spark.sql.files.maxPartitionBytes", str(64 * 1024 * 1024))  # 64 MB
+df = spark.read.csv("s3://bucket/data/")
+
+# 20 GB / 64 MB = 320 partitions
+
+# When to increase: tasks are too small, too many waves
+# When to decrease: tasks are OOMing, data is skewed
+```
+
+### Method 2: Change openCostInBytes (affects small file coalescing)
+
+```python
+# INCREASE → more files packed per partition (fewer partitions for small files)
+spark.conf.set("spark.sql.files.openCostInBytes", str(8 * 1024 * 1024))  # 8 MB
+# 10,000 files × 2 MB:
+# cost per file = 2 MB + 8 MB = 10 MB
+# files per partition = 128 MB / 10 MB = 12
+# total partitions = 10,000 / 12 = 834 (fewer, larger partitions)
+
+# DECREASE → fewer files packed per partition (more partitions for small files)
+spark.conf.set("spark.sql.files.openCostInBytes", str(1 * 1024 * 1024))  # 1 MB
+# cost per file = 2 MB + 1 MB = 3 MB
+# files per partition = 128 MB / 3 MB = 42
+# total partitions = 10,000 / 42 = 238
+
+# When to increase: too many tiny-task partitions
+# When to decrease: files are large enough, don't need aggressive coalescing
+```
+
+### Method 3: repartition() — Full Shuffle
+
+```python
+df = spark.read.csv("s3://bucket/data/")
+# df has 477 partitions (small file coalescing result)
+
+# Repartition to EXACTLY 160 partitions
+df = df.repartition(160)
+
+# What happens internally:
+# → Triggers a FULL SHUFFLE (expensive)
+# → All data redistributed across cluster
+# → 160 new evenly-sized partitions created
+# → Use when you need EXACTLY N evenly distributed partitions
+
+# Repartition by column (for downstream join/groupBy optimization)
+df = df.repartition(200, col("department"))
+# → All rows with same department → same partition
+# → Useful if many groupBy("department") operations follow
+```
+
+### Method 4: coalesce() — No Shuffle (Reduce Only)
+
+```python
+df = spark.read.csv("s3://bucket/data/")
+# df has 477 partitions
+
+# Reduce to 160 partitions WITHOUT shuffle
+df = df.coalesce(160)
+
+# What happens internally:
+# → NO shuffle — just merges adjacent partitions
+# → Partition 0 + Partition 1 + Partition 2 → new Partition 0
+# → Fast, but partitions may be UNEVEN in size
+# → Can only REDUCE partition count, never increase
+
+# When to use coalesce vs repartition:
+# coalesce:     reducing partitions, don't care about balance, want speed
+# repartition:  need even balance, or need to increase partitions, or by column
+```
+
+### Method 5: minPartitions hint (for text files)
+
+```python
+# Force minimum partition count
+df = spark.read \
+         .option("minPartitions", "200") \
+         .csv("s3://bucket/small-file/employees.csv")
+
+# If file is 100 MB normally = 1 partition
+# With minPartitions=200 → Spark tries to create at least 200 partitions
+# Splits the 100 MB file into 200 × 0.5 MB chunks
+
+# Useful when: one large file needs more parallelism than maxPartitionBytes gives
+```
+
+### Method 6: JDBC numPartitions
+
+```python
+df = spark.read \
+    .format("jdbc") \
+    .option("url",             "jdbc:postgresql://host:5432/mydb") \
+    .option("dbtable",         "employees") \
+    .option("partitionColumn", "id") \
+    .option("lowerBound",      "1") \
+    .option("upperBound",      "10000000") \
+    .option("numPartitions",   "50") \     ← controls exactly how many parallel queries
+    .load()
+
+# Creates 50 tasks each running:
+# SELECT * FROM employees WHERE id >= X AND id < Y
+# 50 parallel JDBC connections to database
+```
+
+### Method 7: Explicit repartition at write time (fix for future reads)
+
+```python
+# You have 10,000 small files → slow future reads
+# Fix: rewrite as optimally-sized files
+
+df = spark.read.parquet("s3://bucket/10000-small-files/")
+# df has 477 partitions of small data
+
+df.repartition(160) \
+  .write \
+  .parquet("s3://bucket/160-good-files/")
+
+# Now future reads:
+# 160 files × ~125 MB = 160 partitions, perfect ✅
+```
+
+### Method 8: AQE Coalescing (Automatic, Spark 3.x)
+
+```python
+# Enable AQE (default in Spark 3.2+)
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "128mb")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.minPartitionNum", "1")
+
+# After a shuffle, AQE measures actual partition sizes
+# Automatically coalesces tiny shuffle output partitions
+# e.g., 200 shuffle partitions → only 50 MB total → AQE coalesces to 1 partition
+
+# NOTE: AQE affects post-shuffle partitions, NOT initial file read partitions
+```
+
+---
+
+## 🔵 DECISION GUIDE — What to Use When
+
+```
+SCENARIO                                → SOLUTION
+────────────────────────────────────────────────────────────────────────────────
+One large splittable file, right size   → default maxPartitionBytes, do nothing
+
+One large gzip file, no parallelism     → convert to Parquet+Snappy first
+
+10,000 small files, too many tasks      → increase openCostInBytes
+                                        → OR repartition after read
+                                        → OR rewrite as fewer larger files
+
+Too few partitions, cores underutilized → decrease maxPartitionBytes
+                                        → OR repartition(N) after read
+
+Too many partitions, task overhead high → increase maxPartitionBytes
+                                        → OR coalesce(N) after read
+
+Need exactly N partitions               → repartition(N) after read
+
+Need partitions aligned to a column    → repartition(N, col("key"))
+
+JDBC single-partition bottleneck        → add partitionColumn + numPartitions
+
+S3 listing slow (millions of files)     → use Delta Lake / Iceberg
+                                        → OR use Hive partitioning + filters
+
+Post-shuffle partitions too many/few   → enable AQE (auto-tuning)
+```
+
+---
+
+## 📊 Summary Comparison Table
+
+```
+┌─────────────────────────────┬────────────────────────────────────────────────────────┐
+│ Config / Method             │ What it controls                                       │
+├─────────────────────────────┼────────────────────────────────────────────────────────┤
+│ maxPartitionBytes (128 MB)  │ Max bytes per partition when SPLITTING large files     │
+│                             │ Fewer → more partitions  /  More → fewer partitions   │
+├─────────────────────────────┼────────────────────────────────────────────────────────┤
+│ openCostInBytes (4 MB)      │ Penalty added per file to prevent too many tiny tasks  │
+│                             │ Higher → fewer partitions for small files              │
+├─────────────────────────────┼────────────────────────────────────────────────────────┤
+│ minPartitions               │ Floor on partition count (forces more splits)          │
+├─────────────────────────────┼────────────────────────────────────────────────────────┤
+│ repartition(N)              │ Exact N partitions, even distribution, causes shuffle  │
+├─────────────────────────────┼────────────────────────────────────────────────────────┤
+│ repartition(N, col)         │ N partitions, distributed by column hash, shuffle      │
+├─────────────────────────────┼────────────────────────────────────────────────────────┤
+│ coalesce(N)                 │ Reduce-only, no shuffle, possibly uneven sizes         │
+├─────────────────────────────┼────────────────────────────────────────────────────────┤
+│ JDBC numPartitions          │ Number of parallel DB queries / connections            │
+├─────────────────────────────┼────────────────────────────────────────────────────────┤
+│ AQE coalescePartitions      │ Auto-coalesce tiny post-shuffle partitions at runtime  │
+├─────────────────────────────┼────────────────────────────────────────────────────────┤
+│ Write with repartition      │ Fix file count at write time for future read speed     │
+└─────────────────────────────┴────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🔢 Quick Mental Math Formula
+
+```
+For reading files:
+
+    partitions = max(
+                    minPartitions,
+                    sum(file_sizes) / maxPartitionBytes
+                 )
+
+    But for SMALL FILES, effective partition count uses coalescing:
+    partitions = sum(file_sizes + openCostInBytes per file) / maxPartitionBytes
+
+For JDBC:
+    partitions = numPartitions  (you control it directly)
+
+For POST-SHUFFLE (groupBy, join, orderBy):
+    partitions = spark.sql.shuffle.partitions  (default 200)
+    With AQE:  auto-coalesced based on actual data sizes
+
+Rule of thumb for target partition size:
+    100 MB – 200 MB per partition = sweet spot
+    Less than 10 MB per partition = too small (use coalesce)
+    More than 500 MB per partition = too large (use repartition or reduce maxPartitionBytes)
+```
+
+---
+
+## ⚠️ The 3 Most Common Mistakes
+
+### Mistake 1: Reading millions of small files without coalescing
+```python
+# BAD — 1M files → 1M partitions → massive overhead
+df = spark.read.parquet("s3://bucket/raw-events/")
+
+# GOOD — control partition size
+spark.conf.set("spark.sql.files.maxPartitionBytes", str(256 * 1024 * 1024))
+df = spark.read.parquet("s3://bucket/raw-events/")
+# OR rewrite files into proper sizes first
+```
+
+### Mistake 2: Using repartition() when coalesce() is enough
+```python
+# BAD — causes a full shuffle just to reduce partitions
+df = df.repartition(50)   # was 160 partitions
+
+# GOOD — coalesce merges adjacent partitions, no shuffle
+df = df.coalesce(50)      # was 160 partitions, no shuffle needed
+```
+
+### Mistake 3: Not fixing the small file problem at write time
+```python
+# BAD — writes 200 tiny files (one per partition)
+# If partition data = 1 MB each → 200 × 1 MB = 200 MB in 200 files
+df.write.parquet("s3://bucket/output/")
+
+# GOOD — coalesce before writing to control output file count
+target_file_size_mb = 128
+total_data_mb = 200
+num_files = max(1, total_data_mb // target_file_size_mb)  # = 2
+
+df.coalesce(num_files).write.parquet("s3://bucket/output/")
+# Writes 2 files × ~100 MB = fast future reads ✅
+
+# OR use maxRecordsPerFile option
+df.write.option("maxRecordsPerFile", 1_000_000).parquet("s3://bucket/output/")
+```
+
+# Bucketing & Salting in Spark — Complete Guide with Local CSV & S3 Examples
+
+---
+
+## 📌 Why These Two Techniques Exist — The Root Problems
+
+```
+Problem 1: REPEATED SHUFFLES
+    Every time you join or groupBy the same column → Spark reshuffles EVERY TIME
+    join(orders, customers, "customer_id") → 110 GB shuffled across network
+    Run same join 10 times/day → 1.1 TB shuffled per day — for same data!
+
+    BUCKETING solves this → pre-shuffle ONCE at write time, ZERO shuffle forever after
+
+────────────────────────────────────────────────────────────────────────────────
+
+Problem 2: DATA SKEW
+    Some keys appear WAY more often than others:
+    customer_id = 1 (corporate account) → 50,000,000 rows
+    customer_id = 2 (regular user)      →         50 rows
+
+    After shuffle → 1 task gets 50M rows → takes 3 hours
+    Other 199 tasks finish in seconds → cluster sits idle
+    Entire job waits for that 1 task
+
+    SALTING solves this → spread hot keys across multiple tasks artificially
+```
+
+---
+
+# ═══════════════════════════════════════
+# PART 1 — BUCKETING
+# ═══════════════════════════════════════
+
+---
+
+## 🔵 What Is Bucketing?
+
+```
+Bucketing = writing data to disk PRE-PARTITIONED and PRE-SORTED by a chosen column
+            so that future joins and groupBys on that column require ZERO shuffle
+
+Normal join:   shuffle 110 GB every time      → slow, expensive, repeated
+Bucketed join: read matching bucket files locally → zero network transfer, instant
+
+Stored as: Hive-compatible bucketed Parquet files registered in Hive metastore
+```
+
+---
+
+## 🔵 The Problem Without Bucketing — Local CSV Example
+
+### Our data (local CSV files)
+
+```
+/data/orders.csv    — 100 GB
+    order_id, customer_id, product_id, amount, order_date
+    1001, 5, 101, 250.00, 2024-01-15
+    1002, 8, 204, 89.99,  2024-01-15
+    1003, 5, 305, 120.50, 2024-01-16
+    ...
+
+/data/customers.csv — 10 GB
+    customer_id, name, email, city
+    5,  Alice Johnson, alice@email.com, Mumbai
+    8,  Bob Smith,     bob@email.com,   Delhi
+    ...
+```
+
+### Without bucketing — shuffle fires EVERY time
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import sum, count, avg, col
+
+spark = SparkSession.builder \
+    .appName("NoBucketingDemo") \
+    .getOrCreate()
+
+# Read from local CSV files
+orders = spark.read.csv(
+    "file:///data/orders.csv",
+    header=True,
+    inferSchema=True
+)
+
+customers = spark.read.csv(
+    "file:///data/customers.csv",
+    header=True,
+    inferSchema=True
+)
+
+print(f"Orders partitions:    {orders.rdd.getNumPartitions()}")     # → 800 (100GB/128MB)
+print(f"Customers partitions: {customers.rdd.getNumPartitions()}")  # →  80 (10GB/128MB)
+
+# ── Query 1 (Monday morning) ──────────────────────────────────────
+result1 = orders.join(customers, "customer_id") \
+                .groupBy("city") \
+                .agg(sum("amount").alias("revenue"))
+result1.show()
+# Internally: SHUFFLE orders 100GB + SHUFFLE customers 10GB = 110 GB moved
+
+# ── Query 2 (Monday afternoon — same join!) ───────────────────────
+result2 = orders.join(customers, "customer_id") \
+                .filter(col("order_date") == "2024-01-15") \
+                .groupBy("customer_id") \
+                .agg(count("*").alias("orders_today"))
+result2.show()
+# Internally: SHUFFLE orders 100GB + SHUFFLE customers 10GB = AGAIN 110 GB moved!
+
+# ── Query 3 (Tuesday) — same join again ───────────────────────────
+result3 = orders.join(customers, "customer_id") \
+                .groupBy("name") \
+                .agg(avg("amount").alias("avg_spend"))
+result3.show()
+# Internally: SHUFFLE orders 100GB + SHUFFLE customers 10GB = AGAIN 110 GB moved!
+
+# Total: 3 queries × 110 GB = 330 GB shuffled for the SAME join key
+# 10 queries/day = 1.1 TB shuffled daily — completely avoidable!
+```
+
+### What shuffle looks like on disk without bucketing
+
+```
+After spark.sql.shuffle.partitions = 200:
+
+orders (100 GB, 800 partitions, random order):
+    Part 0:   [cid=5, cid=8, cid=1, cid=302, ...]   ← random mix of customer_ids
+    Part 1:   [cid=8, cid=5, cid=99, cid=1,  ...]   ← same customer_id in multiple parts
+    Part 2:   [cid=1, cid=5, cid=8,  cid=77, ...]
+    ...
+
+Every join must shuffle ALL 100 GB to co-locate matching customer_ids:
+    hash(cid=5) % 200 = 12  → all cid=5 rows go to partition 12
+    hash(cid=8) % 200 = 87  → all cid=8 rows go to partition 87
+    ...
+    EVERY PARTITION sends rows to EVERY other partition = full network scan
+```
+
+---
+
+## 🔵 Bucketing — The Fix: Same Example, With Bucketing
+
+### Step 1: One-time write as bucketed tables (from local CSV)
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import sum, count, avg, col
+
+spark = SparkSession.builder \
+    .appName("BucketingDemo") \
+    .enableHiveSupport() \          # ← REQUIRED for bucketing
+    .config("spark.sql.warehouse.dir", "/warehouse") \
+    .getOrCreate()
+
+# ── Read raw CSV files ─────────────────────────────────────────────
+orders_raw = spark.read.csv(
+    "file:///data/orders.csv",
+    header=True,
+    inferSchema=True
+)
+
+customers_raw = spark.read.csv(
+    "file:///data/customers.csv",
+    header=True,
+    inferSchema=True
+)
+
+# ── ONE-TIME WRITE: bucket both tables by customer_id ─────────────
+orders_raw.write \
+    .bucketBy(200, "customer_id") \     # split into 200 buckets by customer_id
+    .sortBy("customer_id") \            # sort within each bucket
+    .mode("overwrite") \
+    .saveAsTable("orders_bucketed")     # registered in Hive metastore
+
+customers_raw.write \
+    .bucketBy(200, "customer_id") \     # MUST match: same 200 buckets
+    .sortBy("customer_id") \
+    .mode("overwrite") \
+    .saveAsTable("customers_bucketed")
+
+print("Bucketed tables written. This cost one shuffle — paid once, never again.")
+```
+
+### What lands on disk after bucketing
+
+```
+/warehouse/orders_bucketed/
+    part-00000-xxxx.parquet  ← ONLY rows where hash(customer_id) % 200 = 0
+                                e.g., cid=200, cid=400, cid=1800, ...
+    part-00001-xxxx.parquet  ← ONLY rows where hash(customer_id) % 200 = 1
+                                e.g., cid=1, cid=401, cid=1201, ...
+    part-00002-xxxx.parquet  ← ONLY rows where hash(customer_id) % 200 = 2
+    ...
+    part-00199-xxxx.parquet  ← ONLY rows where hash(customer_id) % 200 = 199
+
+/warehouse/customers_bucketed/
+    part-00000-xxxx.parquet  ← ONLY customers where hash(customer_id) % 200 = 0
+    part-00001-xxxx.parquet  ← ONLY customers where hash(customer_id) % 200 = 1
+    ...
+    part-00199-xxxx.parquet  ← ONLY customers where hash(customer_id) % 200 = 199
+
+GUARANTEE:
+    customer_id = 5  → hash(5) % 200 = 12
+    orders_bucketed/part-00012  has ALL orders  for cid=5
+    customers_bucketed/part-00012 has ALL customers for cid=5
+
+    Bucket 12 from orders ↔ Bucket 12 from customers → always co-located ✅
+```
+
+### Step 2: Every future query — ZERO shuffle
+
+```python
+# ── Read bucketed tables ───────────────────────────────────────────
+orders    = spark.table("orders_bucketed")
+customers = spark.table("customers_bucketed")
+
+# ── Query 1 (Monday morning) — ZERO shuffle ───────────────────────
+result1 = orders.join(customers, "customer_id") \
+                .groupBy("city") \
+                .agg(sum("amount").alias("revenue"))
+result1.show()
+# Task 0:   reads orders/part-00000  + customers/part-00000 → local join ✅
+# Task 1:   reads orders/part-00001  + customers/part-00001 → local join ✅
+# ...
+# Task 199: reads orders/part-00199  + customers/part-00199 → local join ✅
+# ZERO bytes shuffled across network
+
+# ── Query 2 (Monday afternoon — ZERO shuffle again) ───────────────
+result2 = orders.join(customers, "customer_id") \
+                .filter(col("order_date") == "2024-01-15") \
+                .groupBy("customer_id") \
+                .agg(count("*").alias("orders_today"))
+result2.show()
+# Still ZERO shuffle — bucket structure already on disk
+
+# ── Query 3 (Tuesday — ZERO shuffle again) ────────────────────────
+result3 = orders.join(customers, "customer_id") \
+                .groupBy("name") \
+                .agg(avg("amount").alias("avg_spend"))
+result3.show()
+# Still ZERO shuffle
+
+# Total: 3 queries × 0 GB = 0 GB shuffled ✅
+# vs unbucketed: 3 × 110 GB = 330 GB shuffled ❌
+```
+
+### Proof — check the physical plan (no Exchange = no shuffle)
+
+```python
+orders    = spark.table("orders_bucketed")
+customers = spark.table("customers_bucketed")
+result    = orders.join(customers, "customer_id")
+
+result.explain(mode="formatted")
+
+# ── WITHOUT bucketing — see Exchange nodes (shuffles): ────────────
+# == Physical Plan ==
+# AdaptiveSparkPlan
+# +- SortMergeJoin [customer_id]
+#    :- Sort [customer_id]
+#    :  +- Exchange hashpartitioning(customer_id, 200)  ← SHUFFLE ❌
+#    :     +- FileScan csv [order_id, customer_id, ...]
+#    +- Sort [customer_id]
+#       +- Exchange hashpartitioning(customer_id, 200)  ← SHUFFLE ❌
+#          +- FileScan csv [customer_id, name, ...]
+
+# ── WITH bucketing — no Exchange nodes at all: ────────────────────
+# == Physical Plan ==
+# SortMergeJoin [customer_id]
+#   :- Sort [customer_id]
+#   :  +- FileScan parquet orders_bucketed [...]         ← NO shuffle ✅
+#   +- Sort [customer_id]
+#      +- FileScan parquet customers_bucketed [...]       ← NO shuffle ✅
+```
+
+---
+
+## 🔵 The Problem Without Bucketing — S3 Example
+
+### Our data (S3 files)
+
+```
+s3://my-company-bucket/raw/orders/
+    part-00000.parquet   (128 MB)
+    part-00001.parquet   (128 MB)
+    ...
+    part-00799.parquet   (128 MB)
+    Total = 100 GB
+
+s3://my-company-bucket/raw/customers/
+    part-00000.parquet   (128 MB)
+    ...
+    part-00079.parquet   (128 MB)
+    Total = 10 GB
+```
+
+### Without bucketing — same shuffle problem on S3
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import sum, count, col
+
+spark = SparkSession.builder \
+    .appName("S3NoBucketingDemo") \
+    .config("spark.hadoop.fs.s3a.access.key", "YOUR_ACCESS_KEY") \
+    .config("spark.hadoop.fs.s3a.secret.key", "YOUR_SECRET_KEY") \
+    .getOrCreate()
+
+# Read from S3
+orders = spark.read.parquet("s3a://my-company-bucket/raw/orders/")
+customers = spark.read.parquet("s3a://my-company-bucket/raw/customers/")
+
+print(f"Orders partitions:    {orders.rdd.getNumPartitions()}")     # → 800
+print(f"Customers partitions: {customers.rdd.getNumPartitions()}")  # →  80
+
+# Every join → 110 GB pulled from S3 into executors + 110 GB shuffled again
+# S3 latency makes this even worse than local (HTTPS requests per partition)
+result = orders.join(customers, "customer_id") \
+               .groupBy("city") \
+               .agg(sum("amount").alias("revenue"))
+result.show()
+
+# Cost: 110 GB S3 → executor transfer + 110 GB executor shuffle = very slow ❌
+```
+
+---
+
+## 🔵 Bucketing — S3 Example
+
+### Step 1: One-time write as bucketed tables to S3-backed warehouse
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import sum, count, avg, col
+
+spark = SparkSession.builder \
+    .appName("S3BucketingDemo") \
+    .enableHiveSupport() \
+    .config("spark.sql.warehouse.dir", "s3a://my-company-bucket/warehouse/") \
+    .config("spark.hadoop.fs.s3a.access.key", "YOUR_ACCESS_KEY") \
+    .config("spark.hadoop.fs.s3a.secret.key", "YOUR_SECRET_KEY") \
+    .getOrCreate()
+
+# ── Read raw data from S3 ──────────────────────────────────────────
+orders_raw = spark.read.parquet("s3a://my-company-bucket/raw/orders/")
+customers_raw = spark.read.parquet("s3a://my-company-bucket/raw/customers/")
+
+# ── ONE-TIME WRITE: bucket and store back to S3 warehouse ─────────
+orders_raw.write \
+    .bucketBy(200, "customer_id") \
+    .sortBy("customer_id") \
+    .mode("overwrite") \
+    .saveAsTable("orders_bucketed")
+# Written to: s3a://my-company-bucket/warehouse/orders_bucketed/
+
+customers_raw.write \
+    .bucketBy(200, "customer_id") \
+    .sortBy("customer_id") \
+    .mode("overwrite") \
+    .saveAsTable("customers_bucketed")
+# Written to: s3a://my-company-bucket/warehouse/customers_bucketed/
+
+print("Done. Files on S3:")
+print("  s3a://my-company-bucket/warehouse/orders_bucketed/part-00000.parquet")
+print("  s3a://my-company-bucket/warehouse/orders_bucketed/part-00001.parquet")
+print("  ...")
+print("  s3a://my-company-bucket/warehouse/orders_bucketed/part-00199.parquet")
+```
+
+### What lands on S3 after bucketing
+
+```
+s3://my-company-bucket/warehouse/orders_bucketed/
+    part-00000-xxxx.parquet  ← all orders where hash(customer_id) % 200 = 0
+    part-00001-xxxx.parquet  ← all orders where hash(customer_id) % 200 = 1
+    ...
+    part-00199-xxxx.parquet  ← all orders where hash(customer_id) % 200 = 199
+
+s3://my-company-bucket/warehouse/customers_bucketed/
+    part-00000-xxxx.parquet  ← all customers where hash(customer_id) % 200 = 0
+    part-00001-xxxx.parquet  ← all customers where hash(customer_id) % 200 = 1
+    ...
+    part-00199-xxxx.parquet  ← all customers where hash(customer_id) % 200 = 199
+```
+
+### Step 2: Every future S3 query — ZERO shuffle
+
+```python
+# Read bucketed tables (Spark reads metadata from Hive metastore)
+orders    = spark.table("orders_bucketed")     # points to S3 bucketed files
+customers = spark.table("customers_bucketed")  # points to S3 bucketed files
+
+# ── Run any join — zero shuffle ────────────────────────────────────
+result = orders.join(customers, "customer_id") \
+               .groupBy("city") \
+               .agg(
+                   sum("amount").alias("total_revenue"),
+                   count("*").alias("order_count"),
+                   avg("amount").alias("avg_order_value")
+               ) \
+               .orderBy(col("total_revenue").desc())
+
+result.show(10)
+# +──────────────+───────────────+─────────────+──────────────────+
+# | city         | total_revenue | order_count | avg_order_value  |
+# +──────────────+───────────────+─────────────+──────────────────+
+# | Mumbai       | 4,500,000.00  | 18,000      | 250.00           |
+# | Delhi        | 3,200,000.00  | 14,500      | 220.69           |
+# +──────────────+───────────────+─────────────+──────────────────+
+
+# What happened:
+# Task 0:   fetched orders/part-00000 from S3 + customers/part-00000 from S3
+#           joined locally in executor memory (NO network shuffle between executors)
+# Task 1:   fetched orders/part-00001 from S3 + customers/part-00001 from S3
+#           joined locally
+# ...
+# Task 199: fetched orders/part-00199 + customers/part-00199, joined locally
+#
+# S3 → executor: yes (reading data)
+# executor → executor: ZERO (no shuffle) ✅
+```
+
+---
+
+## 🔵 Bucketing — groupBy Also Shuffle-Free
+
+```python
+# ── From local CSV (bucketed) ──────────────────────────────────────
+orders = spark.table("orders_bucketed")   # bucketed by customer_id
+
+# groupBy on bucket column → ZERO shuffle
+revenue_by_customer = orders \
+    .groupBy("customer_id") \
+    .agg(
+        sum("amount").alias("total_spent"),
+        count("*").alias("order_count")
+    )
+revenue_by_customer.show(5)
+# All customer_id=5 rows are in bucket 12 → task 12 aggregates locally ✅
+
+# ── From S3 (bucketed) ─────────────────────────────────────────────
+orders_s3 = spark.table("orders_bucketed")  # same table, backed by S3
+
+# groupBy on bucket column → ZERO shuffle (even from S3)
+revenue_s3 = orders_s3 \
+    .groupBy("customer_id") \
+    .agg(sum("amount").alias("total_spent")) \
+    .orderBy(col("total_spent").desc())
+revenue_s3.show(5)
+# Task 12 reads only orders/part-00012 from S3 → aggregates cid=5 locally ✅
+```
+
+---
+
+## 🔵 Bucketing Rules — Must Get These Right
+
+```
+Rule 1: SAME number of buckets on both tables
+    orders.bucketBy(200, "customer_id")    ✅ match
+    customers.bucketBy(200, "customer_id") ✅ match
+
+    orders.bucketBy(200, "customer_id")    ❌ mismatch!
+    customers.bucketBy(100, "customer_id") ❌ → Spark falls back to full shuffle
+
+Rule 2: SAME bucket column on both tables
+    orders.bucketBy(200, "customer_id")    ✅ same column
+    customers.bucketBy(200, "customer_id") ✅ same column
+
+    orders.bucketBy(200, "customer_id")    ❌ different columns
+    customers.bucketBy(200, "order_id")    ❌ → full shuffle fallback
+
+Rule 3: enableHiveSupport() MUST be in SparkSession
+    Without it: bucketing metadata not stored → Spark silently ignores bucketing
+
+Rule 4: Join condition MUST be on the bucket column
+    orders.join(customers, "customer_id")  ✅ joins on bucket col → no shuffle
+    orders.join(customers, "order_date")   ❌ not bucket col → full shuffle
+
+Rule 5: Number of buckets ideally = spark.sql.shuffle.partitions
+    Mismatched → Spark may still shuffle to reconcile partition counts
+
+Rule 6: Both tables must be saveAsTable() — not write.parquet()
+    df.write.bucketBy(200,"id").parquet(path)    ❌ metadata not in Hive
+    df.write.bucketBy(200,"id").saveAsTable(name) ✅ metadata in Hive
+```
+
+---
+
+## 🔵 How Many Buckets?
+
+```
+Formula:
+    target_bucket_file_size = 128 MB – 256 MB  (sweet spot)
+    num_buckets = total_table_size / target_bucket_file_size
+
+For orders (100 GB):
+    100,000 MB / 200 MB = 500 buckets
+
+For our 3-executor cluster (12 cores):
+    Minimum useful buckets = total_cores × 2 = 24
+    But use 200 for future scaling
+
+Rule of thumb:
+    Always match spark.sql.shuffle.partitions (default 200)
+    Use power of 2 or round numbers: 64, 128, 200, 256, 512
+```
+
+---
+
+# ═══════════════════════════════════════
+# PART 2 — SALTING
+# ═══════════════════════════════════════
+
+---
+
+## 🔵 What Is Data Skew? — Local CSV Example First
+
+### Our skewed data
+
+```
+/data/orders.csv — skewed on customer_id
+
+customer_id distribution:
+    customer_id = 1    (large corporate client) → 50,000,000 rows  ← HOT KEY 🔥
+    customer_id = 2    (medium business)        →      10,000 rows
+    customer_id = 3    (small shop)             →          200 rows
+    ...
+    customer_id = 9999 (individual)             →           3 rows
+
+After shuffle with spark.sql.shuffle.partitions = 200:
+    hash(1) % 200 = 83  → Partition 83 gets ALL 50M rows of cid=1 → 1 task overwhelmed
+    hash(2) % 200 = 134 → Partition 134 gets 10K rows → done in seconds
+    ...
+
+Partition 83 task:  50,000,000 rows → runs 3 HOURS ❌
+All other tasks:    tiny            → done in seconds, sit idle
+Whole job waits for partition 83 = 3 hours wasted
+```
+
+### Visualized skew
+
+```
+Task timeline (200 tasks, 12 cores):
+
+Task 0:   ██ (2s)
+Task 1:   ██ (3s)
+Task 2:   ██ (1s)
+...
+Task 83:  █████████████████████████████████████████████ (3 hours!) ← cid=1 all here
+...
+Task 199: ██ (2s)
+
+JOB COMPLETION = max(all tasks) = 3 HOURS ❌
+199 executors sit idle for 3 hours waiting for task 83
+```
+
+---
+
+## 🔵 What Is Salting? — The Core Idea
+
+```
+Salting = append a random number (0 to SALT_FACTOR-1) to the hot key
+          so rows with the same hot key scatter across MULTIPLE partitions
+
+Before salting:
+    customer_id = 1  →  hash("1") % 200 = 83  →  1 partition  →  50M rows  →  3 hours
+
+After salting (SALT_FACTOR = 10):
+    customer_id + "_0"  →  "1_0"  →  hash("1_0") % 200 = 15   →  ~5M rows  → 18 min
+    customer_id + "_1"  →  "1_1"  →  hash("1_1") % 200 = 143  →  ~5M rows  → 18 min
+    customer_id + "_2"  →  "1_2"  →  hash("1_2") % 200 = 67   →  ~5M rows  → 18 min
+    customer_id + "_3"  →  "1_3"  →  hash("1_3") % 200 = 188  →  ~5M rows  → 18 min
+    customer_id + "_4"  →  "1_4"  →  hash("1_4") % 200 = 22   →  ~5M rows  → 18 min
+    customer_id + "_5"  →  "1_5"  →  hash("1_5") % 200 = 91   →  ~5M rows  → 18 min
+    customer_id + "_6"  →  "1_6"  →  hash("1_6") % 200 = 55   →  ~5M rows  → 18 min
+    customer_id + "_7"  →  "1_7"  →  hash("1_7") % 200 = 177  →  ~5M rows  → 18 min
+    customer_id + "_8"  →  "1_8"  →  hash("1_8") % 200 = 39   →  ~5M rows  → 18 min
+    customer_id + "_9"  →  "1_9"  →  hash("1_9") % 200 = 112  →  ~5M rows  → 18 min
+
+10 tasks each handle 5M rows → run in PARALLEL → done in 18 min instead of 3 hours
+```
+
+---
+
+## 🔵 Salting for groupBy — Local CSV Example
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, rand, concat_ws, sum, count, avg, desc
+)
+
+spark = SparkSession.builder \
+    .appName("SaltingGroupByLocal") \
+    .config("spark.sql.shuffle.partitions", "200") \
+    .getOrCreate()
+
+# ── Read skewed CSV from local disk ───────────────────────────────
+orders = spark.read.csv(
+    "file:///data/orders.csv",
+    header=True,
+    inferSchema=True
+)
+
+print(f"Total rows: {orders.count()}")
+print(f"Partitions: {orders.rdd.getNumPartitions()}")
+
+# ── Check skew first ──────────────────────────────────────────────
+print("\nTop 5 keys by row count:")
+orders.groupBy("customer_id") \
+      .count() \
+      .orderBy(desc("count")) \
+      .show(5)
+# +─────────────+────────────+
+# | customer_id | count      |
+# +─────────────+────────────+
+# |           1 | 50,000,000 |  ← HOT KEY
+# |           2 |     10,000 |
+# |           3 |        200 |
+# +─────────────+────────────+
+
+# ════════════════════════════════════════════════════════════════
+# WITHOUT SALTING — SLOW (one task gets 50M rows)
+# ════════════════════════════════════════════════════════════════
+print("\n--- WITHOUT salting ---")
+result_no_salt = orders.groupBy("customer_id") \
+                       .agg(
+                           sum("amount").alias("total_spent"),
+                           count("*").alias("order_count")
+                       )
+result_no_salt.show(5)
+# Task for cid=1 → 50M rows → takes ~3 hours to complete ❌
+
+
+# ════════════════════════════════════════════════════════════════
+# WITH SALTING — FAST (50M rows spread across 10 tasks)
+# ════════════════════════════════════════════════════════════════
+print("\n--- WITH salting ---")
+SALT_FACTOR = 10   # spread hot key across 10 tasks
+
+# Step 1: Add random salt to every row
+orders_salted = orders.withColumn(
+    "salt",
+    (rand() * SALT_FACTOR).cast("int")               # random int 0 to 9
+).withColumn(
+    "salted_key",
+    concat_ws("_",
+        col("customer_id").cast("string"),
+        col("salt").cast("string")
+    )
+    # cid=1, salt=3 → salted_key = "1_3"
+    # cid=1, salt=7 → salted_key = "1_7"
+    # cid=2, salt=1 → salted_key = "2_1"
+)
+
+print("Sample after salting:")
+orders_salted.select("customer_id", "salt", "salted_key", "amount").show(5)
+# +─────────────+────+────────────+────────+
+# | customer_id |salt| salted_key | amount |
+# +─────────────+────+────────────+────────+
+# |           1 |  3 | 1_3        | 250.00 |
+# |           1 |  7 | 1_7        |  89.99 |
+# |           2 |  1 | 2_1        | 120.50 |
+# +─────────────+────+────────────+────────+
+
+
+# Step 2: Partial aggregation on salted_key (splits the hot key across tasks)
+partial_agg = orders_salted \
+    .groupBy("customer_id", "salted_key") \
+    .agg(
+        sum("amount").alias("partial_total"),
+        count("*").alias("partial_count")
+    )
+
+print("Partial aggregation results:")
+partial_agg.orderBy("salted_key").show(15)
+# +─────────────+────────────+───────────────+───────────────+
+# | customer_id | salted_key | partial_total | partial_count |
+# +─────────────+────────────+───────────────+───────────────+
+# |           1 | 1_0        |   500,000.00  |   5,000,000   |  ← 1/10 of cid=1
+# |           1 | 1_1        |   490,000.00  |   4,900,000   |
+# |           1 | 1_2        |   510,000.00  |   5,100,000   |
+# |           1 | 1_3        |   498,000.00  |   4,980,000   |
+# ...
+# |           2 | 2_0        |     2,500.00  |      1,000    |  ← normal key
+# |           2 | 2_3        |     3,100.00  |      1,200    |
+# +─────────────+────────────+───────────────+───────────────+
+
+
+# Step 3: Final aggregation on real customer_id (merge partial results)
+final_result = partial_agg \
+    .groupBy("customer_id") \
+    .agg(
+        sum("partial_total").alias("total_spent"),
+        sum("partial_count").alias("order_count")
+    ) \
+    .withColumn("avg_order", col("total_spent") / col("order_count")) \
+    .orderBy(desc("total_spent"))
+
+print("Final result (correct totals):")
+final_result.show(5)
+# +─────────────+───────────────+─────────────+───────────+
+# | customer_id | total_spent   | order_count | avg_order |
+# +─────────────+───────────────+─────────────+───────────+
+# |           1 | 5,000,000.00  |  50,000,000 | 0.10      |  ← full correct total ✅
+# |           2 |    10,000.00  |      10,000 | 1.00      |
+# +─────────────+───────────────+─────────────+───────────+
+
+# Time: ~18 minutes instead of 3 hours (10x speedup for the hot key) ✅
+```
+
+---
+
+## 🔵 Salting for groupBy — S3 Example
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, rand, concat_ws, sum, count, desc
+)
+
+spark = SparkSession.builder \
+    .appName("SaltingGroupByS3") \
+    .config("spark.sql.shuffle.partitions", "200") \
+    .config("spark.hadoop.fs.s3a.access.key", "YOUR_ACCESS_KEY") \
+    .config("spark.hadoop.fs.s3a.secret.key", "YOUR_SECRET_KEY") \
+    .getOrCreate()
+
+# ── Read skewed data from S3 ───────────────────────────────────────
+orders = spark.read.parquet("s3a://my-company-bucket/raw/orders/")
+
+# ── Detect skew ───────────────────────────────────────────────────
+print("Checking key distribution...")
+orders.groupBy("customer_id") \
+      .count() \
+      .orderBy(desc("count")) \
+      .show(5)
+
+# ════════════════════════════════════════════════════════════════
+# WITH SALTING — all same logic as local, just data source differs
+# ════════════════════════════════════════════════════════════════
+SALT_FACTOR = 10
+
+# Step 1: Add salt
+orders_salted = orders \
+    .withColumn("salt", (rand() * SALT_FACTOR).cast("int")) \
+    .withColumn("salted_key",
+        concat_ws("_",
+            col("customer_id").cast("string"),
+            col("salt").cast("string")
+        )
+    )
+
+# Step 2: Partial aggregation
+partial = orders_salted \
+    .groupBy("customer_id", "salted_key") \
+    .agg(
+        sum("amount").alias("partial_total"),
+        count("*").alias("partial_cnt")
+    )
+
+# Step 3: Final merge
+final = partial \
+    .groupBy("customer_id") \
+    .agg(
+        sum("partial_total").alias("total_spent"),
+        sum("partial_cnt").alias("order_count")
+    )
+
+# Step 4: Write results back to S3
+final.write \
+     .mode("overwrite") \
+     .parquet("s3a://my-company-bucket/output/customer-totals/")
+
+print("Results written to S3 ✅")
+print(f"Output location: s3a://my-company-bucket/output/customer-totals/")
+```
+
+---
+
+## 🔵 Salting for JOIN — Local CSV Example
+
+Joining is harder than groupBy. The challenge: if you randomly salt the left side, the right side doesn't know which salt value to match.
+
+**Solution: randomly salt the left (large) side, then REPLICATE the right (small) side across ALL salt values.**
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, rand, concat_ws, explode, array, lit, sum, count
+)
+
+spark = SparkSession.builder \
+    .appName("SaltingJoinLocal") \
+    .config("spark.sql.shuffle.partitions", "200") \
+    .getOrCreate()
+
+# ── Read both tables from local CSV ───────────────────────────────
+orders = spark.read.csv(
+    "file:///data/orders.csv",
+    header=True,
+    inferSchema=True
+)
+customers = spark.read.csv(
+    "file:///data/customers.csv",
+    header=True,
+    inferSchema=True
+)
+
+SALT_FACTOR = 10
+
+# ════════════════════════════════════════════════════════════════
+# WITHOUT salting — skewed join (3 hours for cid=1 task)
+# ════════════════════════════════════════════════════════════════
+result_no_salt = orders.join(customers, "customer_id") \
+                       .groupBy("name") \
+                       .agg(sum("amount").alias("total"))
+result_no_salt.show(5)  # ← one task takes 3 hours ❌
+
+
+# ════════════════════════════════════════════════════════════════
+# WITH salting — balanced join
+# ════════════════════════════════════════════════════════════════
+
+# Step 1: Salt LEFT side (orders) with a RANDOM salt per row
+orders_salted = orders \
+    .withColumn("salt", (rand() * SALT_FACTOR).cast("int")) \
+    .withColumn("salted_cid",
+        concat_ws("_",
+            col("customer_id").cast("string"),
+            col("salt").cast("string")
+        )
+    )
+
+print("Orders after salting (left side):")
+orders_salted.select("order_id","customer_id","salt","salted_cid","amount").show(5)
+# +──────────+─────────────+────+────────────+────────+
+# | order_id | customer_id |salt| salted_cid | amount |
+# +──────────+─────────────+────+────────────+────────+
+# |     1001 |           1 |  3 | 1_3        | 250.00 |
+# |     1002 |           1 |  7 | 1_7        |  89.99 |  ← same cid, different salt
+# |     1003 |           5 |  2 | 5_2        | 120.50 |
+# +──────────+─────────────+────+────────────+────────+
+
+
+# Step 2: REPLICATE RIGHT side (customers) across ALL salt values
+customers_exploded = customers \
+    .withColumn(
+        "salted_cid",
+        explode(
+            array([
+                concat_ws("_",
+                    col("customer_id").cast("string"),
+                    lit(i).cast("string")
+                )
+                for i in range(SALT_FACTOR)   # i = 0, 1, 2, ..., 9
+            ])
+        )
+    )
+# Each customer row → 10 rows (one for each salt value)
+
+print("Customers after exploding (right side):")
+customers_exploded.select("customer_id","name","salted_cid").show(12)
+# +─────────────+───────────────+────────────+
+# | customer_id | name          | salted_cid |
+# +─────────────+───────────────+────────────+
+# |           1 | Alice Johnson | 1_0        |  ← copy for salt 0
+# |           1 | Alice Johnson | 1_1        |  ← copy for salt 1
+# |           1 | Alice Johnson | 1_2        |  ← copy for salt 2
+# ...
+# |           1 | Alice Johnson | 1_9        |  ← copy for salt 9
+# |           5 | Bob Smith     | 5_0        |
+# ...
+# |           5 | Bob Smith     | 5_9        |
+# +─────────────+───────────────+────────────+
+# customers went from N rows → N × 10 rows (10x larger)
+
+
+# Step 3: JOIN on salted_cid (now balanced!)
+result_salted = orders_salted.join(
+    customers_exploded,
+    orders_salted.salted_cid == customers_exploded.salted_cid,
+    "left"
+).drop(orders_salted.salted_cid) \
+ .drop(customers_exploded.salted_cid) \
+ .drop("salt") \
+ .groupBy("customer_id", "name") \
+ .agg(
+     sum("amount").alias("total_spent"),
+     count("*").alias("order_count")
+ ) \
+ .orderBy(col("total_spent").desc())
+
+result_salted.show(10)
+# +─────────────+───────────────+───────────────+─────────────+
+# | customer_id | name          | total_spent   | order_count |
+# +─────────────+───────────────+───────────────+─────────────+
+# |           1 | Alice Johnson | 5,000,000.00  |  50,000,000 | ✅ correct total
+# |           5 | Bob Smith     |    10,000.00  |      10,000 | ✅
+# +─────────────+───────────────+───────────────+─────────────+
+
+# Task times after salting:
+# Tasks for "1_0" through "1_9": each ~5M rows → ~18 min (in parallel) ✅
+# Total time: 18 min instead of 3 hours ✅
+```
+
+---
+
+## 🔵 Salting for JOIN — S3 Example
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, rand, concat_ws, explode, array, lit, sum, count, desc
+)
+
+spark = SparkSession.builder \
+    .appName("SaltingJoinS3") \
+    .config("spark.sql.shuffle.partitions", "200") \
+    .config("spark.hadoop.fs.s3a.access.key", "YOUR_ACCESS_KEY") \
+    .config("spark.hadoop.fs.s3a.secret.key", "YOUR_SECRET_KEY") \
+    .getOrCreate()
+
+# ── Read both tables from S3 ──────────────────────────────────────
+orders    = spark.read.parquet("s3a://my-company-bucket/raw/orders/")
+customers = spark.read.parquet("s3a://my-company-bucket/raw/customers/")
+
+print(f"Orders    rows: {orders.count():,}")       # 60,000,000
+print(f"Customers rows: {customers.count():,}")    #    500,000
+
+SALT_FACTOR = 10
+
+# Step 1: Salt left side (orders) — random salt per row
+orders_salted = orders \
+    .withColumn("salt", (rand() * SALT_FACTOR).cast("int")) \
+    .withColumn("salted_cid",
+        concat_ws("_",
+            col("customer_id").cast("string"),
+            col("salt").cast("string")
+        )
+    )
+
+# Step 2: Replicate right side (customers) — 10 copies per row
+customers_exploded = customers \
+    .withColumn("salted_cid",
+        explode(
+            array([
+                concat_ws("_",
+                    col("customer_id").cast("string"),
+                    lit(i).cast("string")
+                )
+                for i in range(SALT_FACTOR)
+            ])
+        )
+    )
+
+print(f"Exploded customers rows: {customers_exploded.count():,}")
+# → 500,000 × 10 = 5,000,000 rows (10x, but still small vs orders)
+
+# Step 3: Join on salted key
+result = orders_salted.join(
+    customers_exploded,
+    orders_salted.salted_cid == customers_exploded.salted_cid,
+    "left"
+).drop(orders_salted.salted_cid) \
+ .drop(customers_exploded.salted_cid) \
+ .drop("salt") \
+ .groupBy("customer_id", "name", "city") \
+ .agg(
+     sum("amount").alias("total_revenue"),
+     count("*").alias("order_count")
+ )
+
+# Step 4: Write results back to S3
+result.write \
+      .mode("overwrite") \
+      .parquet("s3a://my-company-bucket/output/salted-join-results/")
+
+print("Done ✅")
+print("Results at: s3a://my-company-bucket/output/salted-join-results/")
+```
+
+---
+
+## 🔵 Salting — Only Salt the Hot Keys (Smarter Approach)
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, rand, when, concat_ws, explode, array, lit, sum, count, desc
+)
+
+spark = SparkSession.builder \
+    .appName("SmartSalting") \
+    .config("spark.sql.shuffle.partitions", "200") \
+    .getOrCreate()
+
+# Works same way for both local and S3 — only source path differs
+# Using S3 here
+orders    = spark.read.parquet("s3a://my-company-bucket/raw/orders/")
+customers = spark.read.parquet("s3a://my-company-bucket/raw/customers/")
+
+# ── Step 1: Identify hot keys programmatically ────────────────────
+HOT_THRESHOLD = 1_000_000   # keys with > 1M rows = hot
+SALT_FACTOR   = 10
+
+key_counts = orders.groupBy("customer_id").count()
+hot_keys   = key_counts.filter(col("count") > HOT_THRESHOLD) \
+                        .select("customer_id")
+
+hot_key_list = [row.customer_id for row in hot_keys.collect()]
+print(f"Hot keys found: {hot_key_list}")
+# Hot keys found: [1, 42, 99]
+
+# ── Step 2: Salt ONLY hot keys on left side ───────────────────────
+orders_salted = orders.withColumn(
+    "salted_cid",
+    when(
+        col("customer_id").isin(hot_key_list),
+        # Hot key → append random salt
+        concat_ws("_",
+            col("customer_id").cast("string"),
+            (rand() * SALT_FACTOR).cast("int").cast("string")
+        )
+    ).otherwise(
+        # Cold key → keep unchanged (no overhead for normal keys)
+        col("customer_id").cast("string")
+    )
+)
+
+print("Sample — hot key gets salt, cold key does not:")
+orders_salted.select("customer_id","salted_cid") \
+             .filter(col("customer_id").isin(1, 500)) \
+             .show(6)
+# +─────────────+────────────+
+# | customer_id | salted_cid |
+# +─────────────+────────────+
+# |           1 | 1_3        |  ← hot key, salted
+# |           1 | 1_7        |  ← hot key, different salt
+# |         500 | 500        |  ← cold key, unchanged
+# +─────────────+────────────+
+
+# ── Step 3: Replicate ONLY hot keys on right side ─────────────────
+customers_salted = customers.withColumn(
+    "salted_cid",
+    when(
+        col("customer_id").isin(hot_key_list),
+        # Hot key → explode into SALT_FACTOR copies
+        explode(
+            array([
+                concat_ws("_",
+                    col("customer_id").cast("string"),
+                    lit(i).cast("string")
+                )
+                for i in range(SALT_FACTOR)
+            ])
+        )
+    ).otherwise(
+        # Cold key → keep as single copy (no replication overhead)
+        col("customer_id").cast("string")
+    )
+)
+
+# ── Step 4: Join and aggregate ────────────────────────────────────
+result = orders_salted.join(
+    customers_salted,
+    orders_salted.salted_cid == customers_salted.salted_cid,
+    "left"
+).drop(orders_salted.salted_cid) \
+ .drop(customers_salted.salted_cid) \
+ .groupBy("customer_id", "name") \
+ .agg(
+     sum("amount").alias("total_spent"),
+     count("*").alias("order_count")
+ ) \
+ .orderBy(desc("total_spent"))
+
+result.show(10)
+# Hot keys → 10x parallel tasks, no skew ✅
+# Cold keys → zero overhead, processed normally ✅
+```
+
+---
+
+## 🔵 AQE — Automatic Skew Handling (Spark 3.0+, No Manual Salting Needed for Joins)
+
+```python
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder \
+    .appName("AQESkewJoin") \
+    .config("spark.sql.adaptive.enabled",                                   "true") \
+    .config("spark.sql.adaptive.skewJoin.enabled",                          "true") \
+    .config("spark.sql.adaptive.skewJoin.skewedPartitionFactor",            "5") \
+    .config("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes",  "256mb") \
+    .getOrCreate()
+
+# ── Works the same for local or S3 ───────────────────────────────
+
+# Local
+orders    = spark.read.csv("file:///data/orders.csv", header=True, inferSchema=True)
+customers = spark.read.csv("file:///data/customers.csv", header=True, inferSchema=True)
+
+# OR S3
+# orders    = spark.read.parquet("s3a://my-company-bucket/raw/orders/")
+# customers = spark.read.parquet("s3a://my-company-bucket/raw/customers/")
+
+# Normal join — AQE handles skew automatically at runtime
+result = orders.join(customers, "customer_id") \
+               .groupBy("name") \
+               .agg(sum("amount").alias("total"))
+result.show(10)
+
+# What AQE does internally (invisible to you):
+#   1. Stage 0 runs → Spark measures actual partition sizes
+#   2. Detects: partition 83 = 50 GB (vs median 300 MB → 166x larger) → SKEWED
+#   3. Automatically splits partition 83 into 10 sub-partitions of ~5 GB each
+#   4. Replicates matching customers partition to all 10 sub-partitions
+#   5. Runs 10 parallel sub-tasks instead of 1 massive task
+#   6. Merges results transparently
+
+# AQE vs manual salting:
+# AQE (Spark 3.0+):  handles JOIN skew automatically ✅
+# Manual salting:    still needed for groupBy skew, or Spark < 3.0
+```
+
+---
+
+## 🔵 How to Detect Skew — Before Deciding to Salt
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, spark_partition_id, desc
+
+spark = SparkSession.builder.appName("SkewDetection").getOrCreate()
+
+# Works same for local or S3 source
+# Local:
+df = spark.read.csv("file:///data/orders.csv", header=True, inferSchema=True)
+# S3:
+# df = spark.read.parquet("s3a://my-company-bucket/raw/orders/")
+
+# ── Method 1: Check key frequency ────────────────────────────────
+print("Key distribution (top 10):")
+df.groupBy("customer_id") \
+  .count() \
+  .orderBy(desc("count")) \
+  .show(10)
+# If top key has 100x more rows than 10th key → salt it
+
+# ── Method 2: Check actual partition sizes after shuffle ──────────
+# Force a shuffle and look at partition row counts
+shuffled = df.repartition(200, col("customer_id"))  # simulate join shuffle
+partition_sizes = shuffled \
+    .withColumn("pid", spark_partition_id()) \
+    .groupBy("pid") \
+    .count() \
+    .orderBy(desc("count"))
+
+partition_sizes.show(10)
+# +────+────────────+
+# | pid|       count|
+# +────+────────────+
+# |  83|  50,000,000|  ← skewed partition!
+# | 134|      10,000|
+# |  12|         200|
+# +────+────────────+
+
+# ── Method 3: Compute skew ratio ─────────────────────────────────
+from pyspark.sql.functions import max as spark_max, percentile_approx
+
+stats = partition_sizes.agg(
+    spark_max("count").alias("max_rows"),
+    percentile_approx("count", 0.5).alias("median_rows")
+)
+stats.show()
+
+# If max_rows / median_rows > 5 → significant skew → consider salting
+# +────────────+─────────────+
+# | max_rows   | median_rows |
+# +────────────+─────────────+
+# | 50,000,000 |       3,000 |  ← ratio = 16,666 → severe skew → SALT IT
+# +────────────+─────────────+
+```
+
+---
+
+## 🔵 Complete Combined Example — Bucketing + Salting Together (S3)
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, rand, when, concat_ws, explode, array, lit,
+    sum, count, avg, desc
+)
+
+spark = SparkSession.builder \
+    .appName("BucketingSaltingFull") \
+    .enableHiveSupport() \
+    .config("spark.sql.warehouse.dir",               "s3a://my-company-bucket/warehouse/") \
+    .config("spark.sql.shuffle.partitions",          "200") \
+    .config("spark.sql.adaptive.enabled",            "true") \
+    .config("spark.sql.adaptive.skewJoin.enabled",   "true") \
+    .config("spark.hadoop.fs.s3a.access.key",        "YOUR_ACCESS_KEY") \
+    .config("spark.hadoop.fs.s3a.secret.key",        "YOUR_SECRET_KEY") \
+    .getOrCreate()
+
+# ════════════════════════════════════════════════════════════════
+# STEP 1: Read raw data (S3 — run once)
+# ════════════════════════════════════════════════════════════════
+orders_raw    = spark.read.parquet("s3a://my-company-bucket/raw/orders/")
+customers_raw = spark.read.parquet("s3a://my-company-bucket/raw/customers/")
+
+# ════════════════════════════════════════════════════════════════
+# STEP 2: Write as bucketed tables (S3 — run once, benefit forever)
+# ════════════════════════════════════════════════════════════════
+orders_raw.write \
+    .bucketBy(200, "customer_id") \
+    .sortBy("customer_id") \
+    .mode("overwrite") \
+    .saveAsTable("orders_bucketed")
+
+customers_raw.write \
+    .bucketBy(200, "customer_id") \
+    .sortBy("customer_id") \
+    .mode("overwrite") \
+    .saveAsTable("customers_bucketed")
+
+print("Bucketed tables written to S3 warehouse ✅")
+
+# ════════════════════════════════════════════════════════════════
+# STEP 3: Read bucketed tables for every query
+# ════════════════════════════════════════════════════════════════
+orders    = spark.table("orders_bucketed")
+customers = spark.table("customers_bucketed")
+
+# ════════════════════════════════════════════════════════════════
+# STEP 4: Detect hot keys
+# ════════════════════════════════════════════════════════════════
+HOT_THRESHOLD = 1_000_000
+SALT_FACTOR   = 10
+
+key_counts   = orders.groupBy("customer_id").count()
+hot_key_list = [r.customer_id for r in
+                key_counts.filter(col("count") > HOT_THRESHOLD).collect()]
+print(f"Hot keys: {hot_key_list}")
+
+# ════════════════════════════════════════════════════════════════
+# STEP 5: Salt hot keys only
+# ════════════════════════════════════════════════════════════════
+orders_salted = orders.withColumn(
+    "salted_cid",
+    when(col("customer_id").isin(hot_key_list),
+         concat_ws("_", col("customer_id").cast("string"),
+                         (rand() * SALT_FACTOR).cast("int").cast("string"))
+    ).otherwise(col("customer_id").cast("string"))
+)
+
+customers_salted = customers.withColumn(
+    "salted_cid",
+    when(col("customer_id").isin(hot_key_list),
+         explode(array([
+             concat_ws("_", col("customer_id").cast("string"), lit(i).cast("string"))
+             for i in range(SALT_FACTOR)
+         ]))
+    ).otherwise(col("customer_id").cast("string"))
+)
+
+# ════════════════════════════════════════════════════════════════
+# STEP 6: Join + aggregate → write results back to S3
+# ════════════════════════════════════════════════════════════════
+result = orders_salted.join(
+    customers_salted,
+    orders_salted.salted_cid == customers_salted.salted_cid
+).drop(orders_salted.salted_cid) \
+ .drop(customers_salted.salted_cid) \
+ .groupBy("customer_id", "name", "city") \
+ .agg(
+     sum("amount").alias("total_spent"),
+     count("*").alias("order_count"),
+     avg("amount").alias("avg_order")
+ ) \
+ .orderBy(desc("total_spent"))
+
+result.show(10)
+
+result.write \
+      .mode("overwrite") \
+      .parquet("s3a://my-company-bucket/output/final-results/")
+
+print("All done ✅")
+print("What we achieved:")
+print("  ✅ Zero shuffle (bucketing — same join key, reads matching buckets locally)")
+print("  ✅ Zero skew   (salting  — hot keys spread across 10 parallel tasks)")
+print("  ✅ AQE enabled (auto-handles any remaining skew Spark detects at runtime)")
+```
+
+---
+
+## ⚠️ Common Mistakes — With Examples
+
+### Mistake 1: Mismatched bucket counts (silent failure)
+```python
+# BAD — different counts → Spark falls back to full shuffle silently
+orders.write.bucketBy(200, "customer_id").saveAsTable("orders_b")
+customers.write.bucketBy(100, "customer_id").saveAsTable("customers_b")
+# Join will STILL work but will shuffle — no error, no warning ❌
+
+# GOOD — both must be exactly 200
+orders.write.bucketBy(200, "customer_id").saveAsTable("orders_b")
+customers.write.bucketBy(200, "customer_id").saveAsTable("customers_b")  # ✅
+```
+
+### Mistake 2: Forgetting two-phase aggregation after salting
+```python
+# BAD — groupBy on salted key gives WRONG partial results
+orders_salted = orders.withColumn("salt", (rand()*10).cast("int")) \
+                      .withColumn("key", concat_ws("_", col("cid"), col("salt")))
+
+result = orders_salted.groupBy("key").agg(sum("amount"))
+# "1_0" → 500,000  ← only 1/10 of cid=1's total!  WRONG ❌
+
+# GOOD — always two phases: partial then final
+partial = orders_salted.groupBy("customer_id","key").agg(sum("amount").alias("p"))
+final   = partial.groupBy("customer_id").agg(sum("p").alias("total"))  # ✅
+```
+
+### Mistake 3: Forgetting enableHiveSupport() for bucketing
+```python
+# BAD — bucketing silently ignored
+spark = SparkSession.builder.appName("App").getOrCreate()
+df.write.bucketBy(200, "id").saveAsTable("my_table")
+# Writes parquet but WITHOUT bucket metadata → reads like normal table → full shuffle
+
+# GOOD
+spark = SparkSession.builder \
+    .appName("App") \
+    .enableHiveSupport() \    # ← essential
+    .getOrCreate()            # ✅
+```
+
+### Mistake 4: Salt factor too high
+```python
+# BAD — 50M rows / 1000 = 50K rows per salt partition → too small
+SALT_FACTOR = 1000
+# Task scheduling overhead > actual compute benefit
+
+# GOOD — target 1M–5M rows per salted partition
+# SALT_FACTOR = hot_key_rows / target_rows_per_task
+SALT_FACTOR = 50_000_000 // 5_000_000   # = 10 ✅
+```
+
+---
+
+## 🎯 Summary
+
+```
+┌────────────────┬──────────────────────────────────────────────────────────────────┐
+│ Technique      │ What / How / When                                                │
+├────────────────┼──────────────────────────────────────────────────────────────────┤
+│ BUCKETING      │ Pre-partitions data by join column at write time                 │
+│                │ .bucketBy(N, col).sortBy(col).saveAsTable()                      │
+│                │ USE WHEN: same join column queried repeatedly                    │
+│                │ BENEFIT: zero shuffle on all future joins + groupBys             │
+│                │ COST: one-time write, enableHiveSupport required                 │
+├────────────────┼──────────────────────────────────────────────────────────────────┤
+│ SALTING        │ Spreads hot keys across multiple partitions artificially         │
+│ (groupBy)      │ Add random salt → partial agg → final agg                       │
+│                │ USE WHEN: one key has far more rows than others                  │
+├────────────────┼──────────────────────────────────────────────────────────────────┤
+│ SALTING        │ Salt left side randomly, EXPLODE right side N times              │
+│ (join)         │ Join on salted key → drop salt column                            │
+│                │ USE WHEN: join key is skewed, Spark < 3.0                       │
+├────────────────┼──────────────────────────────────────────────────────────────────┤
+│ AQE Skew Join  │ Automatic — enable and Spark handles join skew at runtime        │
+│ (Spark 3.0+)   │ spark.sql.adaptive.skewJoin.enabled = true                      │
+│                │ USE WHEN: Spark 3.0+, join skew (NOT groupBy skew)              │
+└────────────────┴──────────────────────────────────────────────────────────────────┘
+
+Data source doesn't change the technique:
+    Local CSV → spark.read.csv("file:///data/file.csv", header=True)
+    S3        → spark.read.parquet("s3a://bucket/path/")
+    Everything else (bucketing, salting logic) is identical
+```
 
 
 # What is Cardinality, high cardinality vs low cardinality and partitioning stretegy on them?
